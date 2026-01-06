@@ -1,0 +1,12 @@
+torch>=2.1.0
+torchvision>=0.16.0
+einops>=0.7.0
+accelerate>=0.24.0
+transformers>=4.35.0
+xformers>=0.0.22
+numpy>=1.24.0
+scipy>=1.9.0
+Pillow>=10.0.0
+lpips>=0.1.4
+tqdm>=4.66.0
+tensorboard>=2.14.0
