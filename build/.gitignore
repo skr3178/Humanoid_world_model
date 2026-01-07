@@ -1,0 +1,78 @@
+# Model checkpoints
+checkpoints*/
+**/checkpoint-*/
+**/pytorch_model.bin
+**/model.safetensors
+**/model.pt
+**/model.pth
+**/*.ckpt
+**/config.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Media files (videos, images, etc.)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.flv
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.svg
+
+# Output directories with generated content
+test_output/
+test_output_*/
+ground_truth_raw/
+comparison_videos/
+visualizations/
+
+# Large dependency directories (submodules/dependencies)
+**/frechet_video_distance-pytorch-/
+**/stylegan-v/
+Metrics/FVD/frechet_video_distance-pytorch-/
+Metrics/FVD/stylegan-v/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
