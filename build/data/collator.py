@@ -108,31 +108,44 @@ class MaskedHWMCollator:
         # STEP 1: CORRUPTION - Apply to BOTH past and future tokens
         # Paper: "we add noise to the latents by corrupting L with random
         # token replacements at a rate uniformly sampled from U(0, ρ_max)"
+        #
+        # Algorithm 1 pattern (matches 1xgpt/data.py):
+        # - Sample u01 ~ U(0,1) once for entire batch
+        # - For each token, sample r ~ U(0,1) and corrupt if r < ρ_max * u01
+        # - This gives effective corruption rate ~ U(0, ρ_max)
         # =================================================================
         corrupt_rate = 0.0
         if self.config.max_corrupt_rate > 0:
-            # Sample ONE corruption rate for entire batch (per paper)
-            corrupt_rate = random.uniform(0, self.config.max_corrupt_rate)
+            # Sample u01 ~ U(0,1) once for entire batch (Algorithm 1 pattern)
+            u01 = random.random()
+            effective_corrupt_rate = self.config.max_corrupt_rate * u01
+            corrupt_rate = effective_corrupt_rate  # For logging/debugging
 
             # Corrupt PAST tokens (but they remain UNMASKED)
-            corrupt_mask_past = torch.rand(batch_size, T_p_clips, H, W) < corrupt_rate
+            # For each token: sample r ~ U(0,1), corrupt if r < ρ_max * u01
+            r_past = torch.rand(batch_size, T_p_clips, H, W)
+            corrupt_mask_past = r_past < effective_corrupt_rate
             for f in range(num_factors):
                 random_tokens = torch.randint(
                     0, self.config.vocab_size,
                     size=(batch_size, T_p_clips, H, W),
                     dtype=video_past_input.dtype,
+                    device=video_past_input.device,
                 )
                 video_past_input[:, f] = torch.where(
                     corrupt_mask_past, random_tokens, video_past_input[:, f]
                 )
 
             # Corrupt FUTURE tokens (before masking)
-            corrupt_mask_future = torch.rand(batch_size, T_f_clips, H, W) < corrupt_rate
+            # For each token: sample r ~ U(0,1), corrupt if r < ρ_max * u01
+            r_future = torch.rand(batch_size, T_f_clips, H, W)
+            corrupt_mask_future = r_future < effective_corrupt_rate
             for f in range(num_factors):
                 random_tokens = torch.randint(
                     0, self.config.vocab_size,
                     size=(batch_size, T_f_clips, H, W),
                     dtype=video_future_input.dtype,
+                    device=video_future_input.device,
                 )
                 video_future_input[:, f] = torch.where(
                     corrupt_mask_future, random_tokens, video_future_input[:, f]

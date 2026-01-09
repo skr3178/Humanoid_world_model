@@ -65,11 +65,16 @@ def parse_args():
 
 def main():
     args = parse_args()
-    
-    # Initialize accelerator
+
+    # Determine mixed precision setting
+    # Will be updated after config is loaded if config specifies mixed_precision
+    # Default to bf16 if CUDA available, otherwise no mixed precision
+    initial_mixed_precision = "bf16" if torch.cuda.is_available() else "no"
+
+    # Initialize accelerator (may be re-initialized after config is loaded)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision="bf16" if torch.cuda.is_available() else "no",
+        mixed_precision=initial_mixed_precision,
     )
     
     # Setup logging
@@ -201,7 +206,18 @@ def main():
     
     # Create model
     model = MaskedHWM(config)
-    
+
+    # Log memory optimization settings
+    mixed_prec = getattr(config, 'mixed_precision', 'bf16')
+    grad_ckpt = getattr(config, 'use_gradient_checkpointing', False)
+    logger.info(f"Memory optimizations: mixed_precision={mixed_prec}, gradient_checkpointing={grad_ckpt}")
+
+    # Note: Gradient checkpointing requires model-level implementation
+    # The main memory savings come from: small model, small batch, mixed precision
+    if grad_ckpt:
+        logger.info("Note: Gradient checkpointing flag is set but requires model-level support")
+        logger.info("Primary memory savings: small model size + small batch + bf16 mixed precision")
+
     # Create optimizer (per paper: betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
     optimizer = torch.optim.AdamW(
         model.parameters(),

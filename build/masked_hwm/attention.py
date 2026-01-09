@@ -101,18 +101,22 @@ class MultiHeadAttention(nn.Module):
         
         # Apply RoPE
         if apply_spatial_rope and self.use_rope_2d:
-            # Reshape for 2D RoPE: (B, num_heads, H, W, head_dim)
-            q = q.view(B, self.num_heads, H, W, self.head_dim)
-            k = k.view(B, self.num_heads, H, W, self.head_dim)
+            # Reshape for 2D RoPE: (B, H, W, num_heads, head_dim)
+            q = q.transpose(1, 2).view(B, H, W, self.num_heads, self.head_dim)
+            k = k.transpose(1, 2).view(B, H, W, self.num_heads, self.head_dim)
             q = self.rope_2d(q)
             k = self.rope_2d(k)
             # Reshape back: (B, num_heads, H*W, head_dim)
-            q = q.view(B, self.num_heads, H * W, self.head_dim)
-            k = k.view(B, self.num_heads, H * W, self.head_dim)
+            q = q.view(B, H * W, self.num_heads, self.head_dim).transpose(1, 2)
+            k = k.view(B, H * W, self.num_heads, self.head_dim).transpose(1, 2)
         elif self.use_rope_1d:
-            # Apply 1D RoPE: (B, num_heads, seq_len, head_dim)
+            # Apply 1D RoPE: need (B, seq_len, num_heads, head_dim)
+            q = q.transpose(1, 2)  # (B, seq_len, num_heads, head_dim)
+            k = k.transpose(1, 2)
             q = self.rope_1d(q)
             k = self.rope_1d(k)
+            q = q.transpose(1, 2)  # (B, num_heads, seq_len, head_dim)
+            k = k.transpose(1, 2)
         
         # Compute attention
         if XFORMERS_AVAILABLE and not apply_spatial_rope:

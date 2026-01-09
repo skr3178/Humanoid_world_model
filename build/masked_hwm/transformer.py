@@ -271,19 +271,20 @@ class TemporalAttention(nn.Module):
 
 class SharedTransformerBlock(nn.Module):
     """Transformer block with factorized attention and parameter sharing.
-    
-    Architecture per block:
-    1. Spatial attention (video only)
-    2. Joint temporal attention (all streams)
-    3. MLP
-    
+
+    Architecture per block (matches Figure 2 diagram):
+    1. Spatial attention (video only) with 2D RoPE
+    2. MLP (video only) - intermediate feedforward after spatial attention
+    3. Joint temporal attention (all streams) with 1D RoPE
+    4. MLP (all streams) - distinct weights per stream
+
     Parameter sharing:
     - layers < shared_layers_start: No sharing (separate params per stream)
-    - layers >= shared_layers_start: Modality sharing
-        - Video streams (v_p, v_f) share spatial attention and MLP
-        - Action streams (a_p, a_f) share MLP
+    - layers >= shared_layers_start: Modality sharing for spatial attention
+        - Video streams (v_p, v_f) share spatial attention
+    - Final MLPs always use distinct weights per stream (as per diagram)
     """
-    
+
     def __init__(
         self,
         layer_idx: int,
@@ -293,12 +294,13 @@ class SharedTransformerBlock(nn.Module):
         self.layer_idx = layer_idx
         self.config = config
         self.use_sharing = layer_idx >= config.shared_layers_start
-        
+
         # Layer norms
         self.spatial_norm = nn.LayerNorm(config.d_model)
+        self.spatial_mlp_norm = nn.LayerNorm(config.d_model)  # For intermediate MLP after spatial attn
         self.temporal_norm = nn.LayerNorm(config.d_model)
         self.mlp_norm = nn.LayerNorm(config.d_model)
-        
+
         # Spatial attention (video only) with 2D RoPE
         if self.use_sharing:
             # Shared spatial attention for both video streams
@@ -331,7 +333,27 @@ class SharedTransformerBlock(nn.Module):
                 attn_drop=config.attn_drop,
                 use_rope=config.use_rope,
             )
-        
+
+        # Intermediate MLP for video streams (after spatial attention, before temporal)
+        # This matches the diagram which shows MLP between spatial and temporal for video
+        if self.use_sharing:
+            self.spatial_mlp = MLP(
+                d_model=config.d_model,
+                mlp_hidden=config.mlp_hidden,
+                mlp_drop=config.mlp_drop,
+            )
+        else:
+            self.spatial_mlp_vp = MLP(
+                d_model=config.d_model,
+                mlp_hidden=config.mlp_hidden,
+                mlp_drop=config.mlp_drop,
+            )
+            self.spatial_mlp_vf = MLP(
+                d_model=config.d_model,
+                mlp_hidden=config.mlp_hidden,
+                mlp_drop=config.mlp_drop,
+            )
+
         # Temporal attention (joint across all streams) with 1D RoPE
         # max_seq_len = 2 * (T_p + T_f) for concatenated streams
         max_temporal_len = 2 * (config.num_past_frames + config.num_future_frames)
@@ -345,42 +367,29 @@ class SharedTransformerBlock(nn.Module):
             use_rope=config.use_rope,
             use_stream_type_emb=config.use_stream_type_emb,
         )
-        
-        # MLP
-        if self.use_sharing:
-            # Shared MLP for video and action streams
-            self.video_mlp = MLP(
-                d_model=config.d_model,
-                mlp_hidden=config.mlp_hidden,
-                mlp_drop=config.mlp_drop,
-            )
-            self.action_mlp = MLP(
-                d_model=config.d_model,
-                mlp_hidden=config.mlp_hidden,
-                mlp_drop=config.mlp_drop,
-            )
-        else:
-            # Separate MLP for each stream
-            self.mlp_vp = MLP(
-                d_model=config.d_model,
-                mlp_hidden=config.mlp_hidden,
-                mlp_drop=config.mlp_drop,
-            )
-            self.mlp_vf = MLP(
-                d_model=config.d_model,
-                mlp_hidden=config.mlp_hidden,
-                mlp_drop=config.mlp_drop,
-            )
-            self.mlp_ap = MLP(
-                d_model=config.d_model,
-                mlp_hidden=config.mlp_hidden,
-                mlp_drop=config.mlp_drop,
-            )
-            self.mlp_af = MLP(
-                d_model=config.d_model,
-                mlp_hidden=config.mlp_hidden,
-                mlp_drop=config.mlp_drop,
-            )
+
+        # Final MLP - distinct weights per stream (as per diagram caption:
+        # "Each stream uses distinct MLP weights in the feedforward stage")
+        self.mlp_vp = MLP(
+            d_model=config.d_model,
+            mlp_hidden=config.mlp_hidden,
+            mlp_drop=config.mlp_drop,
+        )
+        self.mlp_vf = MLP(
+            d_model=config.d_model,
+            mlp_hidden=config.mlp_hidden,
+            mlp_drop=config.mlp_drop,
+        )
+        self.mlp_ap = MLP(
+            d_model=config.d_model,
+            mlp_hidden=config.mlp_hidden,
+            mlp_drop=config.mlp_drop,
+        )
+        self.mlp_af = MLP(
+            d_model=config.d_model,
+            mlp_hidden=config.mlp_hidden,
+            mlp_drop=config.mlp_drop,
+        )
     
     def forward(
         self,
@@ -390,65 +399,67 @@ class SharedTransformerBlock(nn.Module):
         a_f: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass through transformer block.
-        
+
         Args:
             v_p: Past video tokens (B, T_p, H, W, d_model)
             v_f: Future video tokens (B, T_f, H, W, d_model)
             a_p: Past action tokens (B, T_p, d_model)
             a_f: Future action tokens (B, T_f, d_model)
-            
+
         Returns:
             Updated tokens for each stream
         """
         B = v_p.shape[0]
         T_p, T_f = v_p.shape[1], v_f.shape[1]
         H, W = v_p.shape[2], v_p.shape[3]
-        
-        # 1. Spatial attention (video only)
+
+        # 1. Spatial attention (video only) with 2D RoPE
         if self.use_sharing:
             v_p = v_p + self.spatial_attn(self.spatial_norm(v_p))
             v_f = v_f + self.spatial_attn(self.spatial_norm(v_f))
         else:
             v_p = v_p + self.spatial_attn_vp(self.spatial_norm(v_p))
             v_f = v_f + self.spatial_attn_vf(self.spatial_norm(v_f))
-        
-        # 2. Joint temporal attention
+
+        # 2. Intermediate MLP (video only) - between spatial and temporal attention
+        if self.use_sharing:
+            v_p = v_p + self.spatial_mlp(self.spatial_mlp_norm(v_p))
+            v_f = v_f + self.spatial_mlp(self.spatial_mlp_norm(v_f))
+        else:
+            v_p = v_p + self.spatial_mlp_vp(self.spatial_mlp_norm(v_p))
+            v_f = v_f + self.spatial_mlp_vf(self.spatial_mlp_norm(v_f))
+
+        # 3. Joint temporal attention with 1D RoPE
         # Flatten spatial dimensions for video: (B, T, H, W, d) -> (B, T, H*W, d)
         v_p_flat = rearrange(v_p, 'b t h w d -> b t (h w) d')
         v_f_flat = rearrange(v_f, 'b t h w d -> b t (h w) d')
-        
+
         # Apply temporal attention
         v_p_norm = self.temporal_norm(v_p_flat)
         v_f_norm = self.temporal_norm(v_f_flat)
         a_p_norm = self.temporal_norm(a_p)
         a_f_norm = self.temporal_norm(a_f)
-        
+
         v_p_temp, v_f_temp, a_p_temp, a_f_temp = self.temporal_attn(
             v_p_norm, v_f_norm, a_p_norm, a_f_norm, causal=True
         )
-        
+
         # Add residuals
         v_p_flat = v_p_flat + v_p_temp
         v_f_flat = v_f_flat + v_f_temp
         a_p = a_p + a_p_temp
         a_f = a_f + a_f_temp
-        
+
         # Reshape video back to spatial
         v_p = rearrange(v_p_flat, 'b t (h w) d -> b t h w d', h=H, w=W)
         v_f = rearrange(v_f_flat, 'b t (h w) d -> b t h w d', h=H, w=W)
-        
-        # 3. MLP
-        if self.use_sharing:
-            v_p = v_p + self.video_mlp(self.mlp_norm(v_p))
-            v_f = v_f + self.video_mlp(self.mlp_norm(v_f))
-            a_p = a_p + self.action_mlp(self.mlp_norm(a_p))
-            a_f = a_f + self.action_mlp(self.mlp_norm(a_f))
-        else:
-            v_p = v_p + self.mlp_vp(self.mlp_norm(v_p))
-            v_f = v_f + self.mlp_vf(self.mlp_norm(v_f))
-            a_p = a_p + self.mlp_ap(self.mlp_norm(a_p))
-            a_f = a_f + self.mlp_af(self.mlp_norm(a_f))
-        
+
+        # 4. Final MLP - distinct weights per stream
+        v_p = v_p + self.mlp_vp(self.mlp_norm(v_p))
+        v_f = v_f + self.mlp_vf(self.mlp_norm(v_f))
+        a_p = a_p + self.mlp_ap(self.mlp_norm(a_p))
+        a_f = a_f + self.mlp_af(self.mlp_norm(a_f))
+
         return v_p, v_f, a_p, a_f
 
 

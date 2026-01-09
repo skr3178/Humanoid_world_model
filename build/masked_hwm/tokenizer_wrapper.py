@@ -12,6 +12,13 @@ class CosmosTokenizerWrapper:
     Handles encoding/decoding of videos using Cosmos DV 8×8×8 tokenizer.
     Input: RGB video (B, 3, T, 256, 256) in range [-1, 1]
     Output: Discrete tokens (B, T, 32, 32) with values in [0, vocab_size-1]
+    
+    Cosmos FSQ Quantization:
+    - Uses Finite Scalar Quantization (FSQ) with levels [8, 8, 8, 5, 5, 5]
+    - Codebook size: 8 × 8 × 8 × 5 × 5 × 5 = 64,000 tokens
+    - Model uses vocab_size=65536 (2^16) for implementation convenience
+    - Factorized representation: 3 separate FSQ quantizations per position
+    - Output format: [B, 3, H, W] for factorized tokens (v2.0 dataset format)
     """
     
     def __init__(
@@ -145,6 +152,13 @@ class CosmosTokenizerWrapper:
             raise ValueError(f"Expected 4D tensor (B, T, H, W) or (B, 3, H, W), got {tokens.dim()}D")
     
     def get_vocab_size(self) -> int:
-        """Get vocabulary size (codebook size)."""
-        # Cosmos DV uses FSQ with ~64K codebook
+        """Get vocabulary size (codebook size).
+        
+        Returns:
+            Vocabulary size per factor: 65536 (2^16)
+            
+        Note:
+            Cosmos FSQ actual codebook size is 64,000 (8×8×8×5×5×5),
+            but model uses 65536 for implementation convenience (power-of-2).
+        """
         return 65536

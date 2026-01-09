@@ -12,11 +12,17 @@ from .transformer import SharedTransformer
 
 
 class FactorizedEmbedding(nn.Module):
-    """Factorized embedding for v2.0 tokenized video.
+    """Factorized embedding for v2.0 tokenized video (Cosmos FSQ quantization).
 
-    v2.0 uses 3 factorized tokens per spatial position.
-    Each factor has vocab_size=512, total vocab = 512^3.
-
+    v2.0 uses 3 factorized tokens per spatial position from Cosmos DV 8×8×8 tokenizer.
+    
+    Cosmos FSQ Quantization:
+    - Uses Finite Scalar Quantization (FSQ) with levels [8, 8, 8, 5, 5, 5]
+    - Actual codebook size: 8 × 8 × 8 × 5 × 5 × 5 = 64,000 tokens
+    - Model uses vocab_size=65536 (2^16) for implementation convenience
+    - 3 separate FSQ quantizations per position (factorized encoder architecture)
+    - Total effective vocabulary: ~64K^3 ≈ 281 trillion combinations
+    
     We embed each factor separately and sum the embeddings.
     Since we sum N factors, we scale initialization by 1/sqrt(N) to maintain variance.
     """
@@ -31,8 +37,8 @@ class FactorizedEmbedding(nn.Module):
         """Initialize factorized embedding.
 
         Args:
-            num_factored_vocabs: Number of factored tokens per position (3 for v2.0)
-            vocab_size: Vocabulary size per factor (512 for v2.0)
+            num_factored_vocabs: Number of factored tokens per position (3 for Cosmos v2.0)
+            vocab_size: Vocabulary size per factor (65536 for Cosmos FSQ, 2^16)
             d_model: Model dimension
             init_std: Standard deviation for initialization (will be scaled by 1/sqrt(N))
         """
@@ -81,9 +87,14 @@ class MaskedHWM(nn.Module):
     """Masked Humanoid World Model with shared parameters (v2.0 format).
     
     Handles v2.0 dataset with:
-    - Factorized token embeddings (3 factors × vocab_size=512)
-    - Clip-based video (17 frames per clip, temporally compressed)
+    - Factorized token embeddings (3 factors × vocab_size=65536, Cosmos FSQ)
+    - Clip-based video (17 frames per clip, temporally compressed by Cosmos DV 8×8×8)
     - 25-dimensional action space (paper's R^25)
+    
+    Cosmos Tokenization:
+    - FSQ quantization with levels [8, 8, 8, 5, 5, 5] → 64,000 tokens per factor
+    - Model uses vocab_size=65536 (2^16) per factor for implementation convenience
+    - 3 factorized tokens per spatial position: [num_clips, 3, 32, 32]
     """
     
     def __init__(self, config: MaskedHWMConfig):
