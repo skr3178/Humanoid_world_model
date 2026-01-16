@@ -134,7 +134,8 @@ class TimeEmbedding(nn.Module):
         # Sinusoidal embedding
         t_emb = self.sinusoidal(t)
 
-        # MLP projection
+        # MLP projection (match module dtype for mixed precision)
+        t_emb = t_emb.to(self.mlp[0].weight.dtype)
         t_emb = self.mlp(t_emb)
 
         return t_emb

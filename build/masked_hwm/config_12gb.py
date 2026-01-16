@@ -1,16 +1,16 @@
-"""Configuration for 12GB GPU memory constraint.
+"""Configuration for medium-to-small model size (~11GB GPU).
 
-Reduced model size to fit with batch_size=4:
+Reduced model size optimized for ~11GB GPUs:
 - Layers: 6 (25% of full 24-layer model)
 - Dimensions: 192 (37.5% of full 512-dim model)
-- Heads: 4 (192/4 = 48 dim per head)
+- Heads: 6 (32 dim per head)
 - MLP: 768 (scaled with d_model, mlp_ratio=4.0)
-- Batch size: 4 with grad_accum=4 (effective batch=16)
+- Batch size: 1 with grad_accum=16 (effective batch=16)
 
-Memory bottleneck analysis:
-- Main issue: Activation memory from attention matrices (32×32)² = 1024×1024 per frame
-- Model parameters: Embeddings ~100MB (still manageable)
-- Dataset: NOT the issue (batched loading)
+This configuration provides a good balance between:
+- Model capacity (enough to learn complex patterns)
+- Memory efficiency (fits in ~11GB VRAM)
+- Training speed (maintains effective batch size of 16)
 
 Maintains critical settings:
 - vocab_size: 65536 (required for Cosmos tokenizer)
@@ -24,23 +24,23 @@ from typing import Optional
 
 @dataclass
 class MaskedHWM12GBConfig:
-    """Configuration for 12GB GPU (reduced to fit with batch_size=4).
+    """Medium-to-small configuration for ~11GB GPUs.
     
-    Reduced model size to fit in 12GB VRAM while maintaining:
+    Reduced model size that fits in ~11GB VRAM while maintaining:
     - Same vocabulary size (65536) for correct decoding
     - Same action space (25 dims)
     - Same architecture principles
-    - Effective batch size of 16 (via batch_size=4, grad_accum=4)
+    - Effective batch size of 16 (via batch_size=1, grad_accum=16)
     
-    Memory bottleneck: Attention matrices (32×32)² = 1024×1024 per frame per layer
-    Reduced to 6 layers and 192 dim to fit with batch_size=4.
+    Model architecture: 6 layers, 192 dim, 6 heads
+    Reduced to fit in ~11GB VRAM with batch_size=1 (backward pass needs gradient memory).
     """
     
-    # Reduced model architecture to fit 12GB VRAM with batch_size=4
-    num_layers: int = 6  # Reduced from 10 (25% of full 24-layer model)
-    num_heads: int = 4  # Reduced from 8 (192/4 = 48 dim per head)
-    d_model: int = 192  # Reduced from 256 (37.5% of full 512-dim model)
-    mlp_hidden: int = 768  # Reduced from 1024 (scaled with d_model, mlp_ratio=4.0)
+    # Medium model architecture (reduced for ~11GB GPU)
+    num_layers: int = 6  # Further reduced for memory efficiency
+    num_heads: int = 6  # Reduced from 8 (192/6 = 32 dim per head)
+    d_model: int = 192  # Reduced from 256 for memory efficiency
+    mlp_hidden: int = 768  # Scaled with d_model, mlp_ratio=4.0
     mlp_ratio: float = 4.0
     
     # Sequence lengths - Per paper: "2 fully unmasked past latents and 1 partially masked future latent"
@@ -62,16 +62,14 @@ class MaskedHWM12GBConfig:
     frames_per_clip: int = 17  # frames per temporally-compressed clip
     
     # Parameter sharing (adjusted for reduced model)
-    shared_layers_start: int = 2  # First 2 layers unshared, remaining shared (6 layers total)
+    shared_layers_start: int = 2  # First 2 layers unshared, remaining 4 shared (6 layers total)
     
-    # Training configuration (adjusted for 12GB GPU)
-    # Increased LR to compensate for loss averaging (divided by 3 factors)
-    # Original 3e-5 * 3 = 9e-5, using 1e-4 for round number
-    learning_rate: float = 1e-4  # Compensates for loss being averaged across 3 factors
-    warmup_steps: int = 500  # Increased from 100 for more stable training
+    # Training configuration (optimized for ~11GB GPU)
+    learning_rate: float = 1e-4  # Slightly higher for smaller model
+    warmup_steps: int = 100  # Standard warmup
     max_steps: int = 60000
-    batch_size: int = 4  # Increased from 1 for better gradient estimates
-    gradient_accumulation_steps: int = 4  # Effective batch size = 4 * 4 = 16
+    batch_size: int = 1  # Minimal batch size for ~11GB GPU (backward pass needs gradient memory)
+    gradient_accumulation_steps: int = 16  # Effective batch size = 1 * 16 = 16
     
     # Masking configuration (per paper: max_corrupt_rate=0.2)
     max_corrupt_rate: float = 0.2  # Reduced from 0.5 to match paper
@@ -87,6 +85,10 @@ class MaskedHWM12GBConfig:
     
     # Initialization (unchanged)
     init_std: float = 0.02
+    
+    # Memory optimization - bf16 enabled for efficiency
+    use_gradient_checkpointing: bool = False  # Not yet implemented at model level
+    mixed_precision: Optional[str] = "bf16"  # Half precision for memory savings
     
     # Paths (v2.0 dataset)
     tokenizer_checkpoint_dir: str = "/media/skr/storage/robot_world/humanoid_wm/cosmos_tokenizer"

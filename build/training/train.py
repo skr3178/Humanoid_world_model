@@ -57,8 +57,8 @@ def parse_args():
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use_test_config", action="store_true", help="Use reduced test config")
-    parser.add_argument("--use_12gb_config", action="store_true", help="Use 12GB GPU config (10 layers, 256 dim, 8 heads)")
-    parser.add_argument("--use_minimal_config", action="store_true", help="Use minimal config for testing (4 layers, 128 dim, 1+1 clips)")
+    parser.add_argument("--use_12gb_config", action="store_true", help="Use medium config (12 layers, 256 dim, 8 heads) - recommended for 16-24GB GPUs")
+    parser.add_argument("--use_minimal_config", action="store_true", help="Use minimal config for testing (3 layers, 96 dim, 1+1 clips)")
     
     return parser.parse_args()
 
@@ -94,7 +94,7 @@ def main():
             config_dict = json.load(f)
         config = MaskedHWMConfig(**config_dict)
     elif args.use_12gb_config:
-        # Use 12GB GPU config (increased model size for better learning)
+        # Use medium config (12 layers, 256 dim, 8 heads) - balanced for 16-24GB GPUs
         config = MaskedHWM12GBConfig()
         config.train_data_dir = args.train_data_dir
         config.val_data_dir = args.val_data_dir
@@ -107,7 +107,7 @@ def main():
         config.eval_steps = args.eval_steps
         config.logging_steps = args.logging_steps
         config.seed = args.seed
-        logger.info(f"Using 12GB GPU CONFIG ({config.num_layers} layers, {config.d_model} dim, {config.num_heads} heads, {config.mlp_hidden} MLP)")
+        logger.info(f"Using MEDIUM CONFIG ({config.num_layers} layers, {config.d_model} dim, {config.num_heads} heads, {config.mlp_hidden} MLP)")
     elif args.use_minimal_config:
         # Use minimal config for testing on small GPUs
         config = MaskedHWMMinimalConfig()
@@ -350,7 +350,12 @@ def main():
                 continue
             
             # Backward pass
+            # Accelerate handles gradient accumulation automatically
             accelerator.backward(loss)
+            
+            # Clear cache periodically to reduce memory fragmentation
+            if global_step % 10 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # ALWAYS compute gradient norm for diagnostics (before clipping)
             grad_norm_pre_clip = 0.0
@@ -384,6 +389,10 @@ def main():
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+                
+                # Clear cache after optimizer step to free memory
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             # Enhanced logging at EVERY step for gradient diagnostics
             if global_step % config.logging_steps == 0:

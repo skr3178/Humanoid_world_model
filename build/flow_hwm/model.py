@@ -52,13 +52,21 @@ class FlowHWM(nn.Module):
         super().__init__()
         self.config = config
 
-        # Video projection: continuous latent -> model dimension
-        # Input: (B, latent_dim, T, H, W), Output: (B, d_model, T, H, W)
+        # Video projection: continuous latent -> model dimension with patching
+        # Input: (B, latent_dim, T, H, W), Output: (B, d_model, T, H/2, W/2)
         self.video_proj = nn.Conv3d(
             in_channels=config.latent_dim,
             out_channels=config.d_model,
-            kernel_size=1,
-            stride=1,
+            kernel_size=(
+                config.patch_size_temporal,
+                config.patch_size_spatial,
+                config.patch_size_spatial,
+            ),
+            stride=(
+                config.patch_size_temporal,
+                config.patch_size_spatial,
+                config.patch_size_spatial,
+            ),
             padding=0,
         )
 
@@ -75,14 +83,14 @@ class FlowHWM(nn.Module):
         )
 
         # Position embeddings for video (learnable)
-        # Per clip position, shared across spatial positions
+        # Per temporal token position, shared across spatial positions
         self.video_pos_embed = nn.Parameter(
-            torch.zeros(1, config.total_clips, 1, 1, config.d_model)
+            torch.zeros(1, config.total_video_tokens, 1, 1, config.d_model)
         )
 
-        # Position embeddings for actions (at clip level)
+        # Position embeddings for actions (aligned to video token count)
         self.action_pos_embed = nn.Parameter(
-            torch.zeros(1, config.total_clips, config.d_model)
+            torch.zeros(1, config.total_video_tokens, config.d_model)
         )
 
         # Transformer
@@ -91,7 +99,21 @@ class FlowHWM(nn.Module):
         # Output projection: model dim -> latent dim (velocity prediction)
         # Only applied to future video tokens
         self.final_ada_ln = AdaLN(config.d_model)
-        self.output_proj = nn.Linear(config.d_model, config.latent_dim)
+        self.video_unproj = nn.ConvTranspose3d(
+            in_channels=config.d_model,
+            out_channels=config.latent_dim,
+            kernel_size=(
+                config.patch_size_temporal,
+                config.patch_size_spatial,
+                config.patch_size_spatial,
+            ),
+            stride=(
+                config.patch_size_temporal,
+                config.patch_size_spatial,
+                config.patch_size_spatial,
+            ),
+            padding=0,
+        )
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -106,7 +128,7 @@ class FlowHWM(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=self.config.init_std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Conv3d):
+        elif isinstance(module, (nn.Conv3d, nn.ConvTranspose3d)):
             nn.init.normal_(module.weight, mean=0.0, std=self.config.init_std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
@@ -118,18 +140,24 @@ class FlowHWM(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=self.config.init_std)
 
+        # Xavier init for final projection (more stable than zero-init)
+        if module is self.video_unproj:
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
     def _downsample_actions_to_clips(
         self,
         actions: torch.Tensor,
         num_clips: int,
     ) -> torch.Tensor:
-        """Downsample frame-level actions to clip-level.
+        """Downsample frame-level actions to match video token count.
 
-        Uses average pooling to match clip rate.
+        Uses average pooling to match token rate.
 
         Args:
             actions: (B, T_frames, d_model)
-            num_clips: Target number of clips
+            num_clips: Target number of video tokens
 
         Returns:
             Downsampled actions (B, num_clips, d_model)
@@ -218,11 +246,9 @@ class FlowHWM(nn.Module):
         # Apply final AdaLN with time modulation
         v_f_out = self.final_ada_ln(v_f_out, t_emb)
 
-        # Project to velocity: (B, T_f, H, W, d_model) -> (B, T_f, H, W, latent_dim)
-        velocity = self.output_proj(v_f_out)
-
-        # Reshape to (B, C, T_f, H, W)
-        velocity = rearrange(velocity, 'b t h w c -> b c t h w')
+        # Project to velocity: (B, T_f, H, W, d_model) -> (B, d_model, T_f, H, W)
+        velocity = rearrange(v_f_out, 'b t h w c -> b c t h w')
+        velocity = self.video_unproj(velocity)
 
         return velocity
 

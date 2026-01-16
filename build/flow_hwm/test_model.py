@@ -25,8 +25,8 @@ def test_model():
     # Create dummy inputs
     B = 2
     C = config.latent_dim
-    T_p = config.num_past_clips
-    T_f = config.num_future_clips
+    T_p = config.past_video_tokens
+    T_f = config.future_video_tokens
     H = W = config.latent_spatial
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,8 +39,8 @@ def test_model():
     v_f = torch.randn(B, C, T_f, H, W, device=device)
     
     # Actions
-    a_p = torch.randn(B, T_p * config.frames_per_clip, config.action_dim, device=device)
-    a_f = torch.randn(B, T_f * config.frames_per_clip, config.action_dim, device=device)
+    a_p = torch.randn(B, config.past_frames, config.action_dim, device=device)
+    a_f = torch.randn(B, config.future_frames, config.action_dim, device=device)
     
     # Timestep
     t = sample_timesteps(B, device)

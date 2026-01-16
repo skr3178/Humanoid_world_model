@@ -36,7 +36,12 @@ import os
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from flow_hwm.config import FlowHWMConfig, FlowHWMConfigSmall, FlowHWMConfigTest
+from flow_hwm.config import (
+    FlowHWMConfig,
+    FlowHWMConfigMedium,
+    FlowHWMConfigSmall,
+    FlowHWMConfigTest,
+)
 from flow_hwm.model import FlowHWM, create_flow_hwm
 from flow_hwm.flow_matching import sample_noise, euler_step
 
@@ -48,7 +53,7 @@ def generate_video_latents(
     a_p: torch.Tensor,
     a_f: torch.Tensor,
     num_steps: int = 50,
-    cfg_scale: float = 1.5,
+    cfg_scale: float = 3.0,
     verbose: bool = False,
 ) -> torch.Tensor:
     """Generate future video latents using Euler ODE integration.
@@ -72,23 +77,25 @@ def generate_video_latents(
     """
     model.eval()
     device = v_p.device
+    dtype = v_p.dtype
     B = v_p.shape[0]
     config = model.config
 
     # Determine output shape from config
     C = config.latent_dim
-    T_f = config.num_future_clips
+    T_f = config.future_video_tokens
     H = W = config.latent_spatial
 
-    # Start from Gaussian noise X_0
-    x = sample_noise((B, C, T_f, H, W), device)
+    # Start from Gaussian noise X_0 with std matching data distribution
+    noise_std = getattr(config, 'noise_std', 0.5)  # Default to 0.5 for backwards compatibility
+    x = sample_noise((B, C, T_f, H, W), device, std=noise_std).to(dtype=dtype)
 
     # Time step size
     dt = 1.0 / num_steps
 
     # Euler integration from t=0 to t=1
     for step in range(num_steps):
-        t = torch.full((B,), step / num_steps, device=device)
+        t = torch.full((B,), step / num_steps, device=device, dtype=dtype)
 
         if cfg_scale != 1.0:
             # Classifier-free guidance: compute both conditional and unconditional
@@ -238,6 +245,11 @@ def main():
         help="Use small model config",
     )
     parser.add_argument(
+        "--use_medium_config",
+        action="store_true",
+        help="Use medium model config",
+    )
+    parser.add_argument(
         "--use_test_config",
         action="store_true",
         help="Use test model config",
@@ -267,7 +279,7 @@ def main():
     parser.add_argument(
         "--cfg_scale",
         type=float,
-        default=1.5,
+        default=3.0,
         help="Classifier-free guidance scale",
     )
     parser.add_argument(
@@ -300,13 +312,47 @@ def main():
         config = FlowHWMConfigTest()
     elif args.use_small_config:
         config = FlowHWMConfigSmall()
+    elif args.use_medium_config:
+        config = FlowHWMConfigMedium()
     else:
         config = FlowHWMConfig()
+
+    if config.use_cv_tokenizer:
+        from flow_hwm.dataset_latent import infer_cv_temporal_tokens_per_clip
+
+        if config.mixed_precision == "bf16":
+            tokenizer_dtype = "bfloat16"
+        elif config.mixed_precision == "fp16":
+            tokenizer_dtype = "float16"
+        else:
+            tokenizer_dtype = "float32"
+
+        detected_tokens = infer_cv_temporal_tokens_per_clip(
+            cv_tokenizer_dir=config.cv_tokenizer_checkpoint_dir,
+            dv_tokenizer_dir=config.tokenizer_checkpoint_dir,
+            device=args.device,
+            dtype=tokenizer_dtype,
+        )
+        if config.temporal_tokens_per_clip != detected_tokens:
+            print(
+                "Auto-detected temporal tokens per clip: "
+                f"{detected_tokens} (was {config.temporal_tokens_per_clip})."
+            )
+        config.temporal_tokens_per_clip = detected_tokens
 
     # Load model
     print(f"Loading model from {args.checkpoint}...")
     model = load_model_from_checkpoint(args.checkpoint, config, args.device)
     print(f"Model loaded: {model.get_num_params():,} parameters")
+
+    if config.mixed_precision == "bf16" and args.device.startswith("cuda"):
+        inference_dtype = torch.bfloat16
+    elif config.mixed_precision == "fp16" and args.device.startswith("cuda"):
+        inference_dtype = torch.float16
+    else:
+        inference_dtype = torch.float32
+
+    model = model.to(dtype=inference_dtype)
 
     # Load conditioning data
     print(f"Loading conditioning data from {args.data_dir}...")
@@ -317,13 +363,17 @@ def main():
         num_past_clips=config.num_past_clips,
         num_future_clips=config.num_future_clips,
         latent_dim=config.latent_dim,
+        use_cv_tokenizer=config.use_cv_tokenizer,
+        cv_temporal_tokens_per_clip=config.temporal_tokens_per_clip,
+        cv_tokenizer_dir=config.cv_tokenizer_checkpoint_dir,
+        dv_tokenizer_dir=config.tokenizer_checkpoint_dir,
     )
 
     # Get sample
     sample = dataset[args.sample_idx]
-    v_p = sample["latent_past"].unsqueeze(0).to(args.device)  # (1, C, T_p, H, W)
-    a_p = sample["actions_past"].unsqueeze(0).to(args.device)  # (1, T_p_frames, action_dim)
-    a_f = sample["actions_future"].unsqueeze(0).to(args.device)  # (1, T_f_frames, action_dim)
+    v_p = sample["latent_past"].unsqueeze(0).to(args.device, dtype=inference_dtype)  # (1, C, T_p, H, W)
+    a_p = sample["actions_past"].unsqueeze(0).to(args.device, dtype=inference_dtype)  # (1, T_p_frames, action_dim)
+    a_f = sample["actions_future"].unsqueeze(0).to(args.device, dtype=inference_dtype)  # (1, T_f_frames, action_dim)
 
     print(f"Conditioning shapes:")
     print(f"  v_p: {v_p.shape}")

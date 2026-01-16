@@ -44,7 +44,11 @@ from flow_hwm.flow_matching import (
     sample_timesteps,
     sample_noise,
 )
-from flow_hwm.dataset_latent import FlowHWMDataset, create_flow_hwm_dataloader
+from flow_hwm.dataset_latent import (
+    FlowHWMDataset,
+    create_flow_hwm_dataloader,
+    infer_cv_temporal_tokens_per_clip,
+)
 
 
 def get_cosine_schedule_with_warmup(
@@ -95,8 +99,8 @@ def train_step(
     # Sample timestep t ~ U(0, 1)
     t = sample_timesteps(B, device)
 
-    # Sample noise X_0 ~ N(0, I)
-    x0 = sample_noise(v_f.shape, device)
+    # Sample noise X_0 ~ N(0, noise_std^2) - scaled to match data distribution
+    x0 = sample_noise(v_f.shape, device, std=config.noise_std)
 
     # Construct X_t along the flow path
     x_t = construct_flow_path(x0, v_f, t, config.sigma_min)
@@ -196,6 +200,10 @@ def save_checkpoint(
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(description="Train Flow-HWM")
 
     # Data paths
@@ -277,6 +285,28 @@ def main():
     # Set seed
     set_seed(args.seed)
 
+    if config.use_cv_tokenizer:
+        tokenizer_device = "cuda" if torch.cuda.is_available() else "cpu"
+        if config.mixed_precision == "bf16":
+            tokenizer_dtype = "bfloat16"
+        elif config.mixed_precision == "fp16":
+            tokenizer_dtype = "float16"
+        else:
+            tokenizer_dtype = "float32"
+
+        detected_tokens = infer_cv_temporal_tokens_per_clip(
+            cv_tokenizer_dir=config.cv_tokenizer_checkpoint_dir,
+            dv_tokenizer_dir=config.tokenizer_checkpoint_dir,
+            device=tokenizer_device,
+            dtype=tokenizer_dtype,
+        )
+        if config.temporal_tokens_per_clip != detected_tokens:
+            print(
+                "Auto-detected temporal tokens per clip: "
+                f"{detected_tokens} (was {config.temporal_tokens_per_clip})."
+            )
+        config.temporal_tokens_per_clip = detected_tokens
+
     # Initialize accelerator
     accelerator = Accelerator(
         gradient_accumulation_steps=config.gradient_accumulation_steps,
@@ -295,6 +325,7 @@ def main():
         print(f"Warmup steps: {config.warmup_steps}")
         print(f"Mixed precision: {config.mixed_precision}")
         print("=" * 60)
+        sys.stdout.flush()
 
     # Create model
     model = create_flow_hwm(config)
@@ -302,6 +333,7 @@ def main():
     if accelerator.is_main_process:
         num_params = model.get_num_params()
         print(f"Model parameters: {num_params:,} ({num_params / 1e6:.1f}M)")
+        sys.stdout.flush()
 
     # Create datasets
     train_dataloader = create_flow_hwm_dataloader(
@@ -312,6 +344,10 @@ def main():
         latent_dim=config.latent_dim,
         num_workers=args.num_workers,
         shuffle=True,
+        use_cv_tokenizer=config.use_cv_tokenizer,
+        cv_temporal_tokens_per_clip=config.temporal_tokens_per_clip,
+        cv_tokenizer_dir=config.cv_tokenizer_checkpoint_dir,
+        dv_tokenizer_dir=config.tokenizer_checkpoint_dir,
     )
 
     val_dataloader = create_flow_hwm_dataloader(
@@ -322,6 +358,10 @@ def main():
         latent_dim=config.latent_dim,
         num_workers=args.num_workers,
         shuffle=False,
+        use_cv_tokenizer=config.use_cv_tokenizer,
+        cv_temporal_tokens_per_clip=config.temporal_tokens_per_clip,
+        cv_tokenizer_dir=config.cv_tokenizer_checkpoint_dir,
+        dv_tokenizer_dir=config.tokenizer_checkpoint_dir,
     )
 
     # Create optimizer
@@ -354,6 +394,7 @@ def main():
         accelerator.load_state(args.resume_from)
         start_step = int(args.resume_from.split("-")[-1])
         print(f"Resumed from step {start_step}")
+        sys.stdout.flush()
 
     # Setup logging
     checkpoint_dir = Path(args.checkpoint_dir)
@@ -402,6 +443,7 @@ def main():
 
             if accelerator.is_main_process:
                 print(f"Step {step + 1}/{config.max_steps} | Loss: {avg_loss:.4f} | LR: {lr:.2e}")
+                sys.stdout.flush()
 
             running_loss = 0.0
             log_steps = 0
@@ -412,6 +454,7 @@ def main():
 
             if accelerator.is_main_process:
                 print(f"Step {step + 1} | Validation Loss: {val_loss:.4f}")
+                sys.stdout.flush()
 
                 with open(log_file, "a", newline="") as f:
                     writer = csv.writer(f)
@@ -426,6 +469,7 @@ def main():
                     checkpoint_dir, accelerator
                 )
                 print(f"Saved checkpoint at step {step + 1}")
+                sys.stdout.flush()
 
     # Final checkpoint
     if accelerator.is_main_process:
@@ -435,6 +479,7 @@ def main():
             checkpoint_dir, accelerator
         )
         print("Training complete!")
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":

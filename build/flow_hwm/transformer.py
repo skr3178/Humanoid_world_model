@@ -98,13 +98,13 @@ class FlowTransformerBlock(nn.Module):
         # ===== RoPE: 3D for video, 1D for actions =====
         self.rope_3d = RoPE3D(
             head_dim=head_dim,
-            max_t=config.num_past_clips + config.num_future_clips,
-            max_h=config.latent_spatial,
-            max_w=config.latent_spatial,
+            max_t=config.total_video_tokens,
+            max_h=config.token_spatial,
+            max_w=config.token_spatial,
         )
         self.rope_1d = RoPE1D(
             head_dim=head_dim,
-            max_seq_len=(config.num_past_clips + config.num_future_clips) * 2,  # Extra margin
+            max_seq_len=config.total_video_tokens * 2,  # Extra margin
         )
 
         # ===== Per-stream attention output projections (no sharing per method.md) =====
@@ -333,13 +333,13 @@ class FlowTransformerBlockShared(nn.Module):
         # ===== RoPE: 3D for video, 1D for actions =====
         self.rope_3d = RoPE3D(
             head_dim=head_dim,
-            max_t=config.num_past_clips + config.num_future_clips,
-            max_h=config.latent_spatial,
-            max_w=config.latent_spatial,
+            max_t=config.total_video_tokens,
+            max_h=config.token_spatial,
+            max_w=config.token_spatial,
         )
         self.rope_1d = RoPE1D(
             head_dim=head_dim,
-            max_seq_len=(config.num_past_clips + config.num_future_clips) * 2,
+            max_seq_len=config.total_video_tokens * 2,
         )
 
         # ===== SHARED attention output projection =====

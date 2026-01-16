@@ -6,6 +6,25 @@ Flow HWM - Methods:
 
 ![Flow_HM](flow_hwm_transformer.png)
 
+## Tokenizer method:
+
+The Flow-HWM (Flow-Matching variant) in the "Humanoid World Models" paper uses continuous latent space modeling because it is fundamentally a deterministic continuous-time flow model- which operates naturally in continuous (not discrete) representation spaces — unlike the discrete token-based Masked-HWM.
+
+This works best in a continuous vector space (real-valued latents), because:
+
+Discrete tokens (finite codebook) would force jumps/discontinuities → poor velocity field learning.
+Continuous latents allow smooth, differentiable trajectories → stable ODE integration during sampling.
+
+They use Cosmos Continuous 8x16x16 tokenizer (continuous VAE latents, not discrete VQ-VAE), which provides:
+
+16× spatial compression (256→16)
+8× temporal compression
+Real-valued latent vectors (not quantized)
+
+This tokenizer compresses 256x256 frames to 16x16 latents and reduces time by 8x, enabling joint attention with larger flow-matching models than Masked-HWM.
+
+This enables Flow Matching's ODE solver (Euler integration from noise to data) to generate smooth, high-fidelity future frames conditioned on actions and past context.
+
 ### Architecture
 
 **Tokenization**  
@@ -48,6 +67,12 @@ This connects all streams/channels together, preserving per-patch spatial inform
 - If VRAM is tight → add parameter sharing (Full or Modality) in deeper layers (paper shows minimal quality drop with 33–53% size reduction).  
 - For best performance on Flow-HWM → consider testing the 2-stage Split Attention variant (paper's top ablation).
 
+### Key Differences from Masked-HWM
+
+- No Copilot-4D-style corruption or random token replacement (Masked-HWM uses U(0, 0.2) rate on latents).
+- No masking — Flow-HWM operates in continuous latent space (Cosmos Continuous VAE), so no discrete token masking or cosine schedule.
+- Noise is purely the Gaussian prior — no timestep-dependent noise scheduling beyond the linear interpolation path and small \(\sigma_{\min}\).
+
 **Footnotes:**  
 Implementation of 2-stage Split Attention (paper ablation variant):  
 - Each stream first undergoes **independent self-attention** within its own sequence  
@@ -56,6 +81,8 @@ Implementation of 2-stage Split Attention (paper ablation variant):
 
 
 ## Summary
+
+Cosmos Continuous 8x16x16 tokenizer: 16x spatial compression (256x256 to 16x16) + 8x temporal compression. More spatial compression than Masked-HWM enables joint attention with larger flow-matching models. Training uses d=17 transformer layers, h=1172 tokens, AdamW, lr 1e-4, cosine LR schedule, batch size 128, 150k steps on 2x NVIDIA A6000. Patch sizes: p_lw=2, p_t=1. Final linear layers use Xavier init (zero-init was unstable). No LR warmup. Inference uses 50 denoising steps with classifier-free guidance 3.0.
 
 Step 1: AdaLN (α₀, β₀) → QKV → Concat → RoPE
          ↓
@@ -71,3 +98,13 @@ Residual during attention (after attention + γ₀)
 Stream-specific MLP
 γ₁ rescaling after MLP
 Residual during feedforward (after MLP + γ₁)s
+
+
+
+Use command
+
+```
+nohup stdbuf -oL -eL conda run --no-capture-output -n cosmos-tokenizer python -u /media/skr/storage/robot_world/humanoid_wm/build/flow_hwm/train.py --use_medium_config --checkpoint_dir /media/skr/storage/robot_world/humanoid_wm/checkpoints_flow_hwm_medium --train_data_dir /media/skr/storage/robot_world/humanoid_wm/1xgpt/data/train_v2.0 --val_data_dir /media/skr/storage/robot_world/humanoid_wm/1xgpt/data/val_v2.0 > /media/skr/storage/robot_world/humanoid_wm/flow_hwm_medium_train.log 2>&1 &
+
+
+```

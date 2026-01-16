@@ -11,8 +11,8 @@ Masked-HWM which uses discrete tokens. This module provides:
 
 The continuous latents have shape (B, latent_dim, T, H, W) where:
 - latent_dim: Number of latent channels (e.g., 16 for Cosmos)
-- T: Number of temporal clips
-- H, W: Spatial dimensions (32x32 for Cosmos DV 8×8×8)
+- T: Number of temporal tokens (clips * tokens per clip)
+- H, W: Spatial dimensions (16x16 for Cosmos CV 8×16×16)
 """
 
 import json
@@ -31,11 +31,64 @@ sys.path.insert(0, "/media/skr/storage/robot_world/humanoid_wm/build")
 from data.dataset import HumanoidWorldModelDataset, FRAMES_PER_CLIP, SPATIAL_SIZE
 
 
+def infer_cv_temporal_tokens_per_clip(
+    cv_tokenizer_dir: str,
+    dv_tokenizer_dir: str,
+    device: str = "cuda",
+    dtype: str = "bfloat16",
+) -> int:
+    """Infer temporal tokens per clip from the CV encoder."""
+    try:
+        from cosmos_tokenizer.video_lib import CausalVideoTokenizer
+    except ImportError as exc:
+        raise ImportError(
+            "cosmos_tokenizer package not found. "
+            "Install it before using automatic temporal token detection."
+        ) from exc
+
+    enc_path = Path(cv_tokenizer_dir) / "encoder.jit"
+    dec_path = Path(dv_tokenizer_dir) / "decoder.jit"
+    if not enc_path.exists():
+        raise FileNotFoundError(f"CV encoder.jit not found at {enc_path}")
+    if not dec_path.exists():
+        raise FileNotFoundError(f"DV decoder.jit not found at {dec_path}")
+
+    cv_encoder = CausalVideoTokenizer(
+        checkpoint_enc=str(enc_path),
+        device=device,
+        dtype=dtype,
+    )
+    dv_decoder = CausalVideoTokenizer(
+        checkpoint_dec=str(dec_path),
+        device=device,
+        dtype=dtype,
+    )
+
+    with torch.no_grad():
+        # DV tokens: (B=1, 3, 32, 32) -> decoded to (1, 3, 17, 256, 256)
+        tokens = torch.randint(
+            low=0,
+            high=65536,
+            size=(1, 3, SPATIAL_SIZE, SPATIAL_SIZE),
+            device=device,
+            dtype=torch.long,
+        )
+        decoded = dv_decoder.decode(tokens)
+        latents = cv_encoder.encode(decoded)
+        if isinstance(latents, tuple):
+            latents = latents[0]
+
+    if latents.ndim != 5:
+        raise ValueError(f"Unexpected latent shape from CV encoder: {latents.shape}")
+
+    return int(latents.shape[2])
+
+
 class FlowHWMDataset(Dataset):
     """Dataset wrapper that provides continuous latents for Flow-HWM.
 
     Wraps HumanoidWorldModelDataset and converts discrete tokens to
-    approximate continuous latents via learned embedding lookup.
+    continuous latents using Cosmos CV 8×16×16 (or a fallback approximation).
 
     For training, we use the discrete tokens as indices into a learned
     embedding table, producing pseudo-continuous representations. This
@@ -48,6 +101,13 @@ class FlowHWMDataset(Dataset):
         num_future_clips: Number of future clips to predict
         latent_dim: Dimension of continuous latents (default: 16)
         embed_dim: If using embedding lookup, dimension per factor
+        use_cv_tokenizer: If True, decode DV tokens to RGB and re-encode with
+            Cosmos CV 8×16×16 encoder (continuous latents).
+        cv_tokenizer_dir: Directory with CV 8×16×16 encoder checkpoints.
+        dv_tokenizer_dir: Directory with DV 8×8×8 decoder checkpoints.
+        cv_temporal_tokens_per_clip: Temporal tokens per 17-frame clip (default: 3)
+        cv_device: Device for tokenizer inference (e.g., "cuda")
+        cv_dtype: Torch dtype for tokenizer inference (e.g., "bfloat16")
         use_embedding: If True, use embedding lookup for continuous latents
                       If False, use normalized token indices as latents
         **kwargs: Additional arguments passed to HumanoidWorldModelDataset
@@ -59,13 +119,27 @@ class FlowHWMDataset(Dataset):
         num_past_clips: int = 2,
         num_future_clips: int = 1,
         latent_dim: int = 16,
+        use_cv_tokenizer: bool = True,
+        cv_tokenizer_dir: str = "/media/skr/storage/robot_world/humanoid_wm/cosmos_tokenizer/Continuous_video",
+        dv_tokenizer_dir: str = "/media/skr/storage/robot_world/humanoid_wm/cosmos_tokenizer",
+        cv_temporal_tokens_per_clip: Optional[int] = 3,
+        cv_device: str = "cuda",
+        cv_dtype: str = "bfloat16",
         use_embedding: bool = False,
         **kwargs,
     ):
         self.num_past_clips = num_past_clips
         self.num_future_clips = num_future_clips
         self.latent_dim = latent_dim
+        self.use_cv_tokenizer = use_cv_tokenizer
+        self.cv_tokenizer_dir = Path(cv_tokenizer_dir)
+        self.dv_tokenizer_dir = Path(dv_tokenizer_dir)
+        self.cv_temporal_tokens_per_clip = cv_temporal_tokens_per_clip
+        self.cv_device = cv_device
+        self.cv_dtype = cv_dtype
         self.use_embedding = use_embedding
+        self._cv_encoder = None
+        self._dv_decoder = None
 
         # Create underlying discrete token dataset
         self.base_dataset = HumanoidWorldModelDataset(
@@ -75,6 +149,9 @@ class FlowHWMDataset(Dataset):
             use_factored_tokens=True,  # We need factored format
             **kwargs,
         )
+
+        if self.use_cv_tokenizer and self.use_embedding:
+            raise ValueError("use_embedding is incompatible with use_cv_tokenizer.")
 
         # If using embedding, create embedding tables
         # 3 factors, each with vocab size ~65536
@@ -91,6 +168,74 @@ class FlowHWMDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.base_dataset)
+
+    def _ensure_cv_tokenizers(self) -> None:
+        if self._cv_encoder is not None and self._dv_decoder is not None:
+            return
+
+        enc_path = self.cv_tokenizer_dir / "encoder.jit"
+        dec_path = self.dv_tokenizer_dir / "decoder.jit"
+        if not enc_path.exists():
+            raise FileNotFoundError(f"CV encoder.jit not found at {enc_path}")
+        if not dec_path.exists():
+            raise FileNotFoundError(f"DV decoder.jit not found at {dec_path}")
+
+        try:
+            from cosmos_tokenizer.video_lib import CausalVideoTokenizer
+        except ImportError as exc:
+            raise ImportError(
+                "cosmos_tokenizer package not found. "
+                "Install it before using use_cv_tokenizer."
+            ) from exc
+
+        self._cv_encoder = CausalVideoTokenizer(
+            checkpoint_enc=str(enc_path),
+            device=self.cv_device,
+            dtype=self.cv_dtype,
+        )
+        self._dv_decoder = CausalVideoTokenizer(
+            checkpoint_dec=str(dec_path),
+            device=self.cv_device,
+            dtype=self.cv_dtype,
+        )
+
+    def _tokens_to_cv_latents(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Convert DV tokens to continuous CV latents via decode+encode."""
+        if torch.utils.data.get_worker_info() is not None:
+            raise RuntimeError(
+                "use_cv_tokenizer requires num_workers=0 to avoid CUDA in workers."
+            )
+
+        self._ensure_cv_tokenizers()
+
+        # tokens: (T, 3, H, W) -> decoded: (T, 3, 17, 256, 256)
+        tokens = tokens.to(device=self.cv_device)
+        decoded = self._dv_decoder.decode(tokens)
+
+        # Encode each clip independently (batch = num_clips)
+        latents = self._cv_encoder.encode(decoded)
+        if isinstance(latents, tuple):
+            latents = latents[0]
+
+        if latents.ndim != 5:
+            raise ValueError(f"Unexpected latent shape from CV encoder: {latents.shape}")
+        if latents.shape[1] != self.latent_dim:
+            raise ValueError(
+                f"CV encoder channels {latents.shape[1]} != latent_dim {self.latent_dim}"
+            )
+        if self.cv_temporal_tokens_per_clip is None:
+            self.cv_temporal_tokens_per_clip = latents.shape[2]
+        if latents.shape[2] != self.cv_temporal_tokens_per_clip:
+            raise ValueError(
+                "CV temporal tokens per clip mismatch: "
+                f"expected {self.cv_temporal_tokens_per_clip}, got {latents.shape[2]}"
+            )
+
+        # Merge clip and temporal token dimensions: (T_clips, C, t, H, W) -> (C, T_clips*t, H, W)
+        latents = latents.permute(1, 0, 2, 3, 4).contiguous()
+        C, T_clips, t, H, W = latents.shape
+        latents = latents.view(C, T_clips * t, H, W)
+        return latents
 
     def _tokens_to_latents(self, tokens: torch.Tensor) -> torch.Tensor:
         """Convert discrete tokens to continuous latents.
@@ -177,8 +322,12 @@ class FlowHWMDataset(Dataset):
 
         # Convert tokens to continuous latents
         # video_past: (T_p, 3, H, W) -> latent_past: (latent_dim, T_p, H, W)
-        latent_past = self._tokens_to_latents(sample["video_past"])
-        latent_future = self._tokens_to_latents(sample["video_future"])
+        if self.use_cv_tokenizer:
+            latent_past = self._tokens_to_cv_latents(sample["video_past"])
+            latent_future = self._tokens_to_cv_latents(sample["video_future"])
+        else:
+            latent_past = self._tokens_to_latents(sample["video_past"])
+            latent_future = self._tokens_to_latents(sample["video_future"])
 
         return {
             "latent_past": latent_past,
@@ -196,7 +345,8 @@ class FlowHWMLatentDataset(Dataset):
     accurate representation for flow matching.
 
     Expected data format:
-    - latents_{shard_idx}.bin: float32 array of shape [num_clips, latent_dim, H, W]
+    - latents_{shard_idx}.bin: float32 array of shape
+      [num_clips * temporal_tokens_per_clip, latent_dim, H, W]
     - states_{shard_idx}.bin: float32 array of shape [num_frames, 25]
     - segment_idx_{shard_idx}.bin: int32 array of shape [num_frames]
     - metadata.json: Contains num_shards, latent_dim, etc.
@@ -206,6 +356,7 @@ class FlowHWMLatentDataset(Dataset):
         num_past_clips: Number of past video clips
         num_future_clips: Number of future clips to predict
         latent_dim: Dimension of continuous latents
+        temporal_tokens_per_clip: Temporal tokens per clip
         filter_interrupts: Filter sequences spanning multiple segments
         max_shards: Maximum shards to load (for testing)
     """
@@ -216,7 +367,8 @@ class FlowHWMLatentDataset(Dataset):
         num_past_clips: int = 2,
         num_future_clips: int = 1,
         latent_dim: int = 16,
-        spatial_size: int = 32,
+        spatial_size: int = 16,
+        temporal_tokens_per_clip: int = 3,
         filter_interrupts: bool = True,
         max_shards: Optional[int] = None,
     ):
@@ -225,6 +377,7 @@ class FlowHWMLatentDataset(Dataset):
         self.num_future_clips = num_future_clips
         self.latent_dim = latent_dim
         self.spatial_size = spatial_size
+        self.temporal_tokens_per_clip = temporal_tokens_per_clip
         self.filter_interrupts = filter_interrupts
 
         # Load metadata
@@ -288,19 +441,29 @@ class FlowHWMLatentDataset(Dataset):
         else:
             # Infer from file size
             file_size = os.path.getsize(latent_path)
-            elements_per_clip = self.latent_dim * self.spatial_size * self.spatial_size
+            elements_per_clip = (
+                self.latent_dim
+                * self.spatial_size
+                * self.spatial_size
+                * self.temporal_tokens_per_clip
+            )
             num_clips = file_size // (4 * elements_per_clip)  # 4 bytes per float32
             num_frames = num_clips * FRAMES_PER_CLIP
 
         if num_clips == 0:
             return None
 
-        # Load latents: shape [num_clips, latent_dim, H, W]
+        # Load latents: shape [num_clips * temporal_tokens_per_clip, latent_dim, H, W]
         latents = np.memmap(
             latent_path,
             dtype=np.float32,
             mode="r",
-            shape=(num_clips, self.latent_dim, self.spatial_size, self.spatial_size)
+            shape=(
+                num_clips * self.temporal_tokens_per_clip,
+                self.latent_dim,
+                self.spatial_size,
+                self.spatial_size,
+            ),
         )
 
         # Load states: shape [num_frames, 25]
@@ -347,16 +510,42 @@ class FlowHWMLatentDataset(Dataset):
 
         total_clips = self.num_past_clips + self.num_future_clips
 
-        # Extract latents: (total_clips, latent_dim, H, W)
+        # Extract latents: (total_clips * temporal_tokens_per_clip, latent_dim, H, W)
         clip_inds = list(range(start_clip, start_clip + total_clips))
-        latents = shard_info["latents"][clip_inds]
+        token_inds = []
+        for clip_idx in clip_inds:
+            start = clip_idx * self.temporal_tokens_per_clip
+            end = start + self.temporal_tokens_per_clip
+            token_inds.extend(range(start, end))
+        latents = shard_info["latents"][token_inds]
 
-        latent_past = latents[:self.num_past_clips]  # (T_p, latent_dim, H, W)
-        latent_future = latents[self.num_past_clips:]  # (T_f, latent_dim, H, W)
+        # Reshape to (total_clips, temporal_tokens_per_clip, latent_dim, H, W)
+        latents = latents.reshape(
+            total_clips,
+            self.temporal_tokens_per_clip,
+            self.latent_dim,
+            self.spatial_size,
+            self.spatial_size,
+        )
+
+        latent_past = latents[:self.num_past_clips]  # (T_p, t, C, H, W)
+        latent_future = latents[self.num_past_clips:]  # (T_f, t, C, H, W)
 
         # Reshape to (latent_dim, T, H, W)
-        latent_past = np.transpose(latent_past, (1, 0, 2, 3))
-        latent_future = np.transpose(latent_future, (1, 0, 2, 3))
+        latent_past = np.transpose(latent_past, (2, 0, 1, 3, 4))
+        latent_future = np.transpose(latent_future, (2, 0, 1, 3, 4))
+        latent_past = latent_past.reshape(
+            self.latent_dim,
+            self.num_past_clips * self.temporal_tokens_per_clip,
+            self.spatial_size,
+            self.spatial_size,
+        )
+        latent_future = latent_future.reshape(
+            self.latent_dim,
+            self.num_future_clips * self.temporal_tokens_per_clip,
+            self.spatial_size,
+            self.spatial_size,
+        )
 
         # Extract states at frame level
         start_frame = start_clip * FRAMES_PER_CLIP
@@ -388,6 +577,8 @@ def create_flow_hwm_dataloader(
     num_workers: int = 4,
     shuffle: bool = True,
     use_precomputed_latents: bool = False,
+    use_cv_tokenizer: bool = True,
+    cv_temporal_tokens_per_clip: int = 3,
     **kwargs,
 ) -> torch.utils.data.DataLoader:
     """Create a DataLoader for Flow-HWM training.
@@ -401,6 +592,7 @@ def create_flow_hwm_dataloader(
         num_workers: DataLoader workers
         shuffle: Whether to shuffle
         use_precomputed_latents: If True, use FlowHWMLatentDataset
+        cv_temporal_tokens_per_clip: Temporal tokens per clip for CV encoder
         **kwargs: Additional dataset arguments
 
     Returns:
@@ -412,6 +604,7 @@ def create_flow_hwm_dataloader(
             num_past_clips=num_past_clips,
             num_future_clips=num_future_clips,
             latent_dim=latent_dim,
+            temporal_tokens_per_clip=cv_temporal_tokens_per_clip,
             **kwargs,
         )
     else:
@@ -420,14 +613,21 @@ def create_flow_hwm_dataloader(
             num_past_clips=num_past_clips,
             num_future_clips=num_future_clips,
             latent_dim=latent_dim,
+            use_cv_tokenizer=use_cv_tokenizer,
+            cv_temporal_tokens_per_clip=cv_temporal_tokens_per_clip,
             **kwargs,
         )
+
+    if use_cv_tokenizer and num_workers != 0 and not use_precomputed_latents:
+        num_workers = 0
+
+    pin_memory = not use_cv_tokenizer
 
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         drop_last=True,
     )

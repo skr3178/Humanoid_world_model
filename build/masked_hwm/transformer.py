@@ -1,13 +1,20 @@
 """Transformer with parameter sharing for Masked-HWM.
 
+CORRECTED IMPLEMENTATION addressing key issues:
+1. NO causal masking: Bidirectional attention for MaskGIT-style non-autoregressive generation
+2. NO spatial pooling: Each spatial patch treated independently in temporal attention
+3. Actions repeated per spatial patch: Enables spatial-specific action conditioning
+
 Implements factorized attention:
 - Spatial attention: Applied only to video tokens (per-frame) with 2D RoPE
 - Temporal attention: Joint across all 4 streams (v_p, v_f, a_p, a_f) with 1D RoPE
+  - Bidirectional (all tokens attend to all tokens)
+  - Each spatial patch processed independently
 """
 
 import torch
 import torch.nn as nn
-from einops import rearrange
+from einops import rearrange, repeat
 from typing import Optional, Tuple
 
 from .config import MaskedHWMConfig
@@ -123,6 +130,11 @@ class SpatialAttention(nn.Module):
 class TemporalAttention(nn.Module):
     """Temporal attention across all streams (joint attention) with 1D RoPE.
     
+    CORRECTED IMPLEMENTATION:
+    - NO causal masking (bidirectional non-autoregressive attention for MaskGIT-style generation)
+    - NO spatial pooling (each spatial patch treated independently)
+    - Actions repeated for each spatial patch to enable spatial-specific conditioning
+    
     Concatenates all streams and applies attention across temporal dimension.
     Uses 1D Rotary Position Embeddings as described in the paper.
     
@@ -175,16 +187,18 @@ class TemporalAttention(nn.Module):
         v_f: torch.Tensor,
         a_p: torch.Tensor,
         a_f: torch.Tensor,
-        causal: bool = True,
+        causal: bool = False,  # CORRECTED: Default to False for bidirectional attention
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply joint temporal attention across all streams with 1D RoPE.
+        
+        CORRECTED: No causal masking (bidirectional), no spatial pooling.
         
         Args:
             v_p: Past video tokens (B, T_p, S, d_model) where S = H*W
             v_f: Future video tokens (B, T_f, S, d_model)
             a_p: Past action tokens (B, T_p, d_model)
             a_f: Future action tokens (B, T_f, d_model)
-            causal: Whether to apply causal masking
+            causal: Whether to apply causal masking (default False for MaskGIT-style)
             
         Returns:
             Updated tokens for each stream
@@ -193,14 +207,22 @@ class TemporalAttention(nn.Module):
         T_p, T_f = v_p.shape[1], v_f.shape[1]
         S = v_p.shape[2]  # Spatial dimension (H*W)
         
-        # Pool video tokens spatially: (B, T, S, d) -> (B, T, d)
-        v_p_pooled = v_p.mean(dim=2)  # (B, T_p, d)
-        v_f_pooled = v_f.mean(dim=2)  # (B, T_f, d)
+        # CORRECTED: NO spatial pooling - treat each spatial patch independently
+        # Reshape video tokens: (B, T, S, d) -> (B*S, T, d)
+        # This allows each spatial patch to attend independently
+        v_p_reshaped = rearrange(v_p, 'b t s d -> (b s) t d')  # (B*S, T_p, d)
+        v_f_reshaped = rearrange(v_f, 'b t s d -> (b s) t d')  # (B*S, T_f, d)
+        
+        # CORRECTED: Repeat actions for each spatial patch
+        # This enables spatial-specific action conditioning
+        # Use einops repeat for cleaner code: (B, T, d) -> (B*S, T, d)
+        a_p_reshaped = repeat(a_p, 'b t d -> (b s) t d', s=S)  # (B*S, T_p, d)
+        a_f_reshaped = repeat(a_f, 'b t d -> (b s) t d', s=S)  # (B*S, T_f, d)
         
         # Concatenate all streams: [v_p, v_f, a_p, a_f]
         # Total sequence length: T_p + T_f + T_p + T_f = 2*(T_p + T_f)
         # Stream identity is implicit via position in this concatenation
-        all_tokens = torch.cat([v_p_pooled, v_f_pooled, a_p, a_f], dim=1)  # (B, total_T, d)
+        all_tokens = torch.cat([v_p_reshaped, v_f_reshaped, a_p_reshaped, a_f_reshaped], dim=1)  # (B*S, total_T, d)
         total_T = all_tokens.shape[1]
         
         # Optionally add stream-type embeddings to make stream identity explicit
@@ -214,33 +236,35 @@ class TemporalAttention(nn.Module):
                 torch.full((T_f,), 3, dtype=torch.long, device=all_tokens.device),  # a_f
             ])  # (total_T,)
             stream_emb = self.stream_type_emb[stream_indices]  # (total_T, d_model)
-            all_tokens = all_tokens + stream_emb.unsqueeze(0)  # (B, total_T, d_model)
+            all_tokens = all_tokens + stream_emb.unsqueeze(0)  # (B*S, total_T, d_model)
         
         # Compute QKV
-        qkv = self.qkv(all_tokens)  # (B, total_T, 3*d)
+        qkv = self.qkv(all_tokens)  # (B*S, total_T, 3*d)
         q, k, v = qkv.chunk(3, dim=-1)
         
-        # Reshape for multi-head attention: (B, num_heads, total_T, head_dim)
-        q = q.view(B, total_T, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, total_T, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, total_T, self.num_heads, self.head_dim).transpose(1, 2)
+        # Reshape for multi-head attention: (B*S, num_heads, total_T, head_dim)
+        q = q.view(-1, total_T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(-1, total_T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(-1, total_T, self.num_heads, self.head_dim).transpose(1, 2)
         
         # Apply 1D RoPE to queries and keys
         if self.use_rope:
-            # Transpose for RoPE: (B, total_T, num_heads, head_dim)
+            # Transpose for RoPE: (B*S, total_T, num_heads, head_dim)
             q_temp = q.transpose(1, 2)
             k_temp = k.transpose(1, 2)
             
             q_temp = self.rope_1d(q_temp)
             k_temp = self.rope_1d(k_temp)
             
-            # Transpose back: (B, num_heads, total_T, head_dim)
+            # Transpose back: (B*S, num_heads, total_T, head_dim)
             q = q_temp.transpose(1, 2)
             k = k_temp.transpose(1, 2)
         
         # Compute attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, num_heads, total_T, total_T)
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B*S, num_heads, total_T, total_T)
         
+        # CORRECTED: NO causal masking by default (bidirectional for MaskGIT-style)
+        # Only apply if explicitly requested (for compatibility)
         if causal:
             # Apply causal mask
             causal_mask = torch.triu(torch.ones(total_T, total_T, device=attn.device, dtype=torch.bool), diagonal=1)
@@ -250,21 +274,26 @@ class TemporalAttention(nn.Module):
         attn = self.attn_drop(attn)
         
         # Apply attention to values
-        out = attn @ v  # (B, num_heads, total_T, head_dim)
-        out = out.transpose(1, 2).reshape(B, total_T, self.d_model)  # (B, total_T, d)
+        out = attn @ v  # (B*S, num_heads, total_T, head_dim)
+        out = out.transpose(1, 2).reshape(-1, total_T, self.d_model)  # (B*S, total_T, d)
         
         # Project output
         out = self.proj(out)
         
         # Split back into streams
-        v_p_out = out[:, :T_p]  # (B, T_p, d)
-        v_f_out = out[:, T_p:T_p + T_f]  # (B, T_f, d)
-        a_p_out = out[:, T_p + T_f:T_p + T_f + T_p]  # (B, T_p, d)
-        a_f_out = out[:, T_p + T_f + T_p:]  # (B, T_f, d)
+        v_p_out = out[:, :T_p]  # (B*S, T_p, d)
+        v_f_out = out[:, T_p:T_p + T_f]  # (B*S, T_f, d)
+        a_p_out = out[:, T_p + T_f:T_p + T_f + T_p]  # (B*S, T_p, d)
+        a_f_out = out[:, T_p + T_f + T_p:]  # (B*S, T_f, d)
         
-        # Broadcast back to spatial dimension for video
-        v_p_out = v_p_out.unsqueeze(2).expand(-1, -1, S, -1)  # (B, T_p, S, d)
-        v_f_out = v_f_out.unsqueeze(2).expand(-1, -1, S, -1)  # (B, T_f, S, d)
+        # Reshape video back to original shape: (B*S, T, d) -> (B, T, S, d)
+        v_p_out = rearrange(v_p_out, '(b s) t d -> b t s d', b=B, s=S)
+        v_f_out = rearrange(v_f_out, '(b s) t d -> b t s d', b=B, s=S)
+        
+        # For actions, take mean across spatial dimension (since we repeated them)
+        # This aggregates the spatial-specific conditioning back to a single action representation
+        a_p_out = rearrange(a_p_out, '(b s) t d -> b s t d', b=B, s=S).mean(dim=1)  # (B, T_p, d)
+        a_f_out = rearrange(a_f_out, '(b s) t d -> b s t d', b=B, s=S).mean(dim=1)  # (B, T_f, d)
         
         return v_p_out, v_f_out, a_p_out, a_f_out
 
@@ -441,7 +470,7 @@ class SharedTransformerBlock(nn.Module):
         a_f_norm = self.temporal_norm(a_f)
 
         v_p_temp, v_f_temp, a_p_temp, a_f_temp = self.temporal_attn(
-            v_p_norm, v_f_norm, a_p_norm, a_f_norm, causal=True
+            v_p_norm, v_f_norm, a_p_norm, a_f_norm, causal=False  # CORRECTED: Bidirectional attention for MaskGIT-style
         )
 
         # Add residuals

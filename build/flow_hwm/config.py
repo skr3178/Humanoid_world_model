@@ -11,7 +11,7 @@ Key differences from Masked-HWM:
 - Inference: Euler ODE solver vs iterative MaskGIT unmasking
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -29,7 +29,10 @@ class FlowHWMConfig:
 
         Latent Dimensions (Cosmos continuous latents):
             latent_dim: Number of latent channels from Cosmos encoder
-            latent_spatial: Spatial size of latent (32x32)
+            latent_spatial: Spatial size of latent (16x16)
+            temporal_tokens_per_clip: Temporal tokens per clip (CV 8x => 3 for 17 frames)
+            patch_size_spatial: Spatial patch size (p_lw)
+            patch_size_temporal: Temporal patch size (p_t)
             num_past_clips: Number of past video clips for context
             num_future_clips: Number of future clips to predict
 
@@ -55,7 +58,8 @@ class FlowHWMConfig:
             mixed_precision: Mixed precision mode ('bf16', 'fp16', or None)
 
         Paths:
-            tokenizer_checkpoint_dir: Path to Cosmos tokenizer
+            tokenizer_checkpoint_dir: Path to Cosmos tokenizer (DV decoder)
+            cv_tokenizer_checkpoint_dir: Path to Cosmos CV tokenizer (encoder)
             train_data_dir: Training data directory
             val_data_dir: Validation data directory
             test_data_dir: Test data directory
@@ -69,9 +73,12 @@ class FlowHWMConfig:
     mlp_ratio: float = 4.0
 
     # Latent dimensions (Cosmos continuous latents)
-    # Cosmos DV 8×8×8: 256×256 → 32×32 spatial, 8× temporal compression
+    # Cosmos CV 8×16×16: 256×256 → 16×16 spatial, 8× temporal compression
     latent_dim: int = 16  # Cosmos encoder output channels
-    latent_spatial: int = 32  # 32×32 spatial tokens per frame
+    latent_spatial: int = 16  # 16×16 spatial tokens per frame
+    temporal_tokens_per_clip: int = 3  # 17 frames -> 3 temporal tokens (ceil(17/8))
+    patch_size_spatial: int = 2  # p_lw
+    patch_size_temporal: int = 1  # p_t
     num_past_clips: int = 2  # Past context clips
     num_future_clips: int = 1  # Future clips to predict
 
@@ -83,17 +90,18 @@ class FlowHWMConfig:
     # - Index 23: Linear Velocity
     # - Index 24: Angular Velocity
     action_dim: int = 25
-    frames_per_clip: int = 17  # Cosmos DV temporal compression
+    frames_per_clip: int = 17  # Dataset clips aligned to 17-frame DV segments
 
     # Flow matching parameters
-    sigma_min: float = 0.001  # Small constant ensuring non-zero support at t=1
+    sigma_min: float = 0.0  # Must be 0 for Cosmos tokenizer (decoder is extremely sensitive to token values)
+    noise_std: float = 0.5  # Noise std to match data distribution (latents have std ~0.48)
     cfg_drop_prob: float = 0.1  # Classifier-free guidance dropout probability
-    cfg_scale: float = 1.5  # Guidance scale at inference (1.0 = no guidance)
+    cfg_scale: float = 3.0  # Guidance scale at inference (1.0 = no guidance)
     num_euler_steps: int = 50  # ODE integration steps for inference
 
     # Training configuration
     learning_rate: float = 3e-5
-    warmup_steps: int = 100
+    warmup_steps: int = 0
     max_steps: int = 60000
     batch_size: int = 4  # Per-device batch size for 24GB GPU
     gradient_accumulation_steps: int = 4  # Effective batch size = 16
@@ -111,8 +119,14 @@ class FlowHWMConfig:
     # Initialization
     init_std: float = 0.02
 
+    # Dataset/tokenizer behavior
+    use_cv_tokenizer: bool = True
+
     # Paths (v2.0 dataset)
+    # DV checkpoint path (decoder used to reconstruct RGB before CV encoding)
     tokenizer_checkpoint_dir: str = "/media/skr/storage/robot_world/humanoid_wm/cosmos_tokenizer"
+    # CV checkpoint path (continuous encoder for CV 8×16×16)
+    cv_tokenizer_checkpoint_dir: str = "/media/skr/storage/robot_world/humanoid_wm/cosmos_tokenizer/Continuous_video"
     train_data_dir: str = "/media/skr/storage/robot_world/humanoid_wm/1xgpt/data/train_v2.0"
     val_data_dir: str = "/media/skr/storage/robot_world/humanoid_wm/1xgpt/data/val_v2.0"
     test_data_dir: Optional[str] = "/media/skr/storage/robot_world/humanoid_wm/1xgpt/data/test_v2.0"
@@ -132,6 +146,26 @@ class FlowHWMConfig:
     def total_clips(self) -> int:
         """Total number of clips (past + future)."""
         return self.num_past_clips + self.num_future_clips
+
+    @property
+    def total_video_tokens(self) -> int:
+        """Total video tokens across all clips."""
+        return self.total_clips * self.temporal_tokens_per_clip
+
+    @property
+    def past_video_tokens(self) -> int:
+        """Video tokens for past clips."""
+        return self.num_past_clips * self.temporal_tokens_per_clip
+
+    @property
+    def future_video_tokens(self) -> int:
+        """Video tokens for future clips."""
+        return self.num_future_clips * self.temporal_tokens_per_clip
+
+    @property
+    def token_spatial(self) -> int:
+        """Spatial tokens per frame after patching."""
+        return self.latent_spatial // self.patch_size_spatial
 
     @property
     def past_frames(self) -> int:

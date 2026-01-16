@@ -17,11 +17,16 @@ Key equations from Section 2.3:
     Loss = E[||u_theta(X_t, P, t) - V_t||^2]   ... (3)
 
 where:
-    X_0 ~ N(0, I) is Gaussian noise
+    X_0 ~ N(0, I) is Gaussian noise (no corruption or masking)
     X_1 is the target video latent
     t in [0, 1] is the timestep
     sigma_min is a small constant (0.001) ensuring non-zero support at t=1
     P = {v_p, a_p, a_f} is the conditioning context
+
+Key differences from Masked-HWM:
+    - No Copilot-4D-style corruption or random token replacement.
+    - No masking or cosine schedule (continuous latents only).
+    - No timestep-dependent noise schedule beyond the linear path.
 """
 
 import torch
@@ -137,17 +142,25 @@ def sample_timesteps(
     return torch.rand(batch_size, device=device) * (max_t - min_t) + min_t
 
 
-def sample_noise(shape: Tuple[int, ...], device: torch.device) -> Tensor:
-    """Sample Gaussian noise X_0 ~ N(0, I).
+def sample_noise(
+    shape: Tuple[int, ...],
+    device: torch.device,
+    std: float = 1.0,
+) -> Tensor:
+    """Sample Gaussian noise X_0 ~ N(0, std^2).
+
+    IMPORTANT: The noise std should match the data distribution.
+    For latents normalized to [-1, 1] with std ~0.5, use std=0.5.
 
     Args:
         shape: Shape of noise tensor
         device: Device to create tensor on
+        std: Standard deviation of noise (default: 1.0, use 0.5 for normalized latents)
 
     Returns:
-        Noise tensor of given shape
+        Noise tensor of given shape with specified std
     """
-    return torch.randn(shape, device=device)
+    return torch.randn(shape, device=device) * std
 
 
 class FlowMatchingTrainer:
@@ -155,21 +168,24 @@ class FlowMatchingTrainer:
 
     Encapsulates the flow matching training logic:
     1. Sample timesteps t ~ U(0, 1)
-    2. Sample noise x0 ~ N(0, I)
+    2. Sample noise x0 ~ N(0, noise_std^2)
     3. Construct X_t and target V_t
     4. Compute loss
 
     Args:
         sigma_min: Small constant for flow path
+        noise_std: Std of noise distribution (should match data std, ~0.5 for normalized latents)
         cfg_drop_prob: Probability of dropping conditioning for CFG
     """
 
     def __init__(
         self,
         sigma_min: float = 0.001,
+        noise_std: float = 0.5,
         cfg_drop_prob: float = 0.1,
     ):
         self.sigma_min = sigma_min
+        self.noise_std = noise_std
         self.cfg_drop_prob = cfg_drop_prob
 
     def prepare_training_inputs(
@@ -192,8 +208,8 @@ class FlowMatchingTrainer:
         # Sample timesteps
         t = sample_timesteps(B, device)
 
-        # Sample noise
-        x0 = sample_noise(x1.shape, device)
+        # Sample noise with std matching data distribution
+        x0 = sample_noise(x1.shape, device, std=self.noise_std)
 
         # Construct X_t
         x_t = construct_flow_path(x0, x1, t, self.sigma_min)

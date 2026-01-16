@@ -31,9 +31,9 @@ def example_training_step():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     
-    v_p = torch.randn(B, config.latent_dim, config.num_past_clips, 
+    v_p = torch.randn(B, config.latent_dim, config.past_video_tokens, 
                      config.latent_spatial, config.latent_spatial, device=device)
-    v_f = torch.randn(B, config.latent_dim, config.num_future_clips,
+    v_f = torch.randn(B, config.latent_dim, config.future_video_tokens,
                      config.latent_spatial, config.latent_spatial, device=device)
     a_p = torch.randn(B, config.past_frames, config.action_dim, device=device)
     a_f = torch.randn(B, config.future_frames, config.action_dim, device=device)
@@ -77,7 +77,7 @@ def example_inference():
     
     # Create conditioning context
     B = 1
-    v_p = torch.randn(B, config.latent_dim, config.num_past_clips,
+    v_p = torch.randn(B, config.latent_dim, config.past_video_tokens,
                      config.latent_spatial, config.latent_spatial, device=device)
     a_p = torch.randn(B, config.past_frames, config.action_dim, device=device)
     a_f = torch.randn(B, config.future_frames, config.action_dim, device=device)
