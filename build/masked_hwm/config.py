@@ -113,8 +113,9 @@ class MaskedHWMConfig:
     test_data_dir: Optional[str] = "/media/skr/storage/robot_world/humanoid_wm/1xgpt/data/test_v2.0"
     
     # Memory optimization
-    use_gradient_checkpointing: bool = False
-    mixed_precision: Optional[str] = None  # None, 'fp16', or 'bf16'
+    use_gradient_checkpointing: bool = False  # Recompute activations during backward (~50% memory reduction)
+    use_flash_attn: bool = True  # Auto-detect and use Flash Attention or xformers if available
+    mixed_precision: Optional[str] = None  # None, 'fp16', or 'bf16' (handled by Accelerator in train.py)
 
     # Other
     seed: int = 42
@@ -133,9 +134,16 @@ class MaskedHWMRTX4090Config(MaskedHWMConfig):
     - Gradient accumulation of 2 steps (effective batch size = 16)
     - Gradient checkpointing enabled
     - Mixed precision training (bf16)
+    - Flash Attention / xformers enabled
 
     This configuration preserves the paper's effective batch size and model
     quality while fitting within GPU memory constraints.
+
+    Memory savings breakdown:
+    - Gradient checkpointing: ~50% activation memory reduction
+    - Mixed precision (bf16): ~40-50% memory reduction
+    - Flash Attention: ~60-70% attention memory reduction
+    - Combined: Can reduce peak memory by 60-80%
     """
 
     # Memory-optimized training (maintains effective batch size = 16)
@@ -144,6 +152,7 @@ class MaskedHWMRTX4090Config(MaskedHWMConfig):
 
     # Memory optimization techniques
     use_gradient_checkpointing: bool = True
+    use_flash_attn: bool = True  # Auto-detect Flash Attention / xformers
     mixed_precision: str = "bf16"  # Use bf16 for RTX 4090
 
     # Model architecture (UNCHANGED - maintains paper quality)

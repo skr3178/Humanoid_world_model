@@ -23,6 +23,7 @@ from masked_hwm.config import MaskedHWMConfig
 from masked_hwm.config_test import MaskedHWMTestConfig
 from masked_hwm.config_12gb import MaskedHWM12GBConfig
 from masked_hwm.config_minimal import MaskedHWMMinimalConfig
+from masked_hwm.config_rtx3060 import MaskedHWMRTX3060Config
 from masked_hwm.model import MaskedHWM
 from data.dataset import HumanoidWorldModelDataset
 from data.collator import MaskedHWMCollator
@@ -59,6 +60,7 @@ def parse_args():
     parser.add_argument("--use_test_config", action="store_true", help="Use reduced test config")
     parser.add_argument("--use_12gb_config", action="store_true", help="Use medium config (12 layers, 256 dim, 8 heads) - recommended for 16-24GB GPUs")
     parser.add_argument("--use_minimal_config", action="store_true", help="Use minimal config for testing (3 layers, 96 dim, 1+1 clips)")
+    parser.add_argument("--use_rtx3060_config", action="store_true", help="Use RTX 3060 config (12 layers, 256 dim, 8 heads) - optimized for 12GB GPUs")
     
     return parser.parse_args()
 
@@ -93,6 +95,26 @@ def main():
         with open(args.config) as f:
             config_dict = json.load(f)
         config = MaskedHWMConfig(**config_dict)
+    elif args.use_rtx3060_config:
+        # Use RTX 3060 config (12 layers, 256 dim, 8 heads) - optimized for 12GB GPUs
+        config = MaskedHWMRTX3060Config()
+        config.train_data_dir = args.train_data_dir
+        config.val_data_dir = args.val_data_dir
+        config.test_data_dir = args.test_data_dir
+        # Use config defaults for batch_size, grad_accum, lr (optimized for 12GB)
+        # Only override if explicitly set by user
+        if args.max_steps != 60000:  # Default argparse value
+            config.max_steps = args.max_steps
+        if args.save_steps != 1000:
+            config.save_steps = args.save_steps
+        if args.eval_steps != 1000:
+            config.eval_steps = args.eval_steps
+        if args.logging_steps != 100:
+            config.logging_steps = args.logging_steps
+        config.seed = args.seed
+        logger.info(f"Using RTX 3060 CONFIG ({config.num_layers} layers, {config.d_model} dim, {config.num_heads} heads, {config.mlp_hidden} MLP)")
+        logger.info(f"  batch_size={config.batch_size}, grad_accum={config.gradient_accumulation_steps}, effective_batch={config.batch_size * config.gradient_accumulation_steps}")
+        logger.info(f"  learning_rate={config.learning_rate}, max_steps={config.max_steps}")
     elif args.use_12gb_config:
         # Use medium config (12 layers, 256 dim, 8 heads) - balanced for 16-24GB GPUs
         config = MaskedHWM12GBConfig()

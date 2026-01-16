@@ -1,4 +1,11 @@
-"""Training script for Masked-HWM."""
+"""Training script for Masked-HWM.
+
+Memory optimizations available:
+- Mixed precision (bf16): Enabled by default via Accelerator
+- Gradient checkpointing: Enable via config.use_gradient_checkpointing = True
+- Flash Attention: Auto-detected if flash-attn or xformers is installed
+- 8-bit Adam: Enable via --use_8bit_adam flag (requires bitsandbytes)
+"""
 
 import argparse
 import os
@@ -23,6 +30,13 @@ from masked_hwm.config_12gb import MaskedHWM12GBConfig
 from masked_hwm.model import MaskedHWM
 from data.dataset import HumanoidWorldModelDataset
 from data.collator import MaskedHWMCollator
+
+# Try to import 8-bit optimizer
+try:
+    from bitsandbytes.optim import AdamW8bit
+    BITSANDBYTES_AVAILABLE = True
+except ImportError:
+    BITSANDBYTES_AVAILABLE = False
 
 
 logger = get_logger(__name__)
@@ -54,7 +68,15 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use_test_config", action="store_true", help="Use reduced test config")
     parser.add_argument("--use_12gb_config", action="store_true", help="Use 12GB GPU config (12 layers, 256 dim)")
-    
+
+    # Memory optimization flags
+    parser.add_argument("--use_8bit_adam", action="store_true",
+                        help="Use 8-bit AdamW optimizer (requires bitsandbytes, saves ~75%% optimizer memory)")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                        help="Enable gradient checkpointing (saves ~50%% activation memory, ~20%% slower)")
+    parser.add_argument("--no_flash_attn", action="store_true",
+                        help="Disable Flash Attention even if available")
+
     return parser.parse_args()
 
 
@@ -126,7 +148,29 @@ def main():
             logging_steps=args.logging_steps,
             seed=args.seed,
         )
-    
+
+    # Apply memory optimization flags from command line
+    if args.gradient_checkpointing:
+        config.use_gradient_checkpointing = True
+        logger.info("Gradient checkpointing ENABLED (~50% activation memory reduction)")
+
+    if args.no_flash_attn:
+        config.use_flash_attn = False
+        logger.info("Flash Attention DISABLED")
+    else:
+        config.use_flash_attn = True  # Auto-detect at runtime
+
+    # Log memory optimization status
+    if accelerator.is_local_main_process:
+        from masked_hwm.transformer import print_memory_optimization_status, FLASH_ATTN_AVAILABLE, XFORMERS_AVAILABLE
+        print_memory_optimization_status()
+        if args.use_8bit_adam:
+            if BITSANDBYTES_AVAILABLE:
+                logger.info("8-bit AdamW ENABLED (~75% optimizer memory reduction)")
+            else:
+                logger.warning("8-bit AdamW requested but bitsandbytes not installed. Using standard AdamW.")
+                logger.warning("Install with: pip install bitsandbytes")
+
     # Create datasets
     train_dataset = HumanoidWorldModelDataset(
         data_dir=config.train_data_dir,
@@ -168,14 +212,26 @@ def main():
     
     # Create model
     model = MaskedHWM(config)
-    
-    # Create optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-        betas=(0.9, 0.999),
-        weight_decay=0.01,
-    )
+
+    # Enable gradient checkpointing on the transformer if requested
+    if config.use_gradient_checkpointing:
+        model.transformer.enable_gradient_checkpointing()
+
+    # Create optimizer (8-bit AdamW if available and requested)
+    if args.use_8bit_adam and BITSANDBYTES_AVAILABLE:
+        optimizer = AdamW8bit(
+            model.parameters(),
+            lr=config.learning_rate,
+            betas=(0.9, 0.999),
+            weight_decay=0.01,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            betas=(0.9, 0.999),
+            weight_decay=0.01,
+        )
     
     # Create scheduler - linear decay (per paper)
     num_training_steps = config.max_steps

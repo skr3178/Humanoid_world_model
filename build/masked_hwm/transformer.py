@@ -10,15 +10,34 @@ Implements factorized attention:
 - Temporal attention: Joint across all 4 streams (v_p, v_f, a_p, a_f) with 1D RoPE
   - Bidirectional (all tokens attend to all tokens)
   - Each spatial patch processed independently
+
+Memory optimizations:
+- Gradient checkpointing: Recompute activations during backward pass
+- Flash Attention / xformers: Memory-efficient attention implementation
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from einops import rearrange, repeat
 from typing import Optional, Tuple
 
 from .config import MaskedHWMConfig
 from .rope import RoPE1D, RoPE2D
+
+# Try to import memory-efficient attention backends
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+
+try:
+    from xformers.ops import memory_efficient_attention
+    XFORMERS_AVAILABLE = True
+except ImportError:
+    XFORMERS_AVAILABLE = False
 
 
 class MLP(nn.Module):
@@ -39,11 +58,13 @@ class MLP(nn.Module):
 
 class SpatialAttention(nn.Module):
     """Spatial attention for video tokens (applied per frame) with 2D RoPE.
-    
+
     Attends across spatial positions within each frame.
     Uses 2D Rotary Position Embeddings as described in the paper.
+
+    Memory optimization: Uses Flash Attention or xformers when available.
     """
-    
+
     def __init__(
         self,
         d_model: int,
@@ -53,6 +74,7 @@ class SpatialAttention(nn.Module):
         proj_bias: bool = True,
         attn_drop: float = 0.0,
         use_rope: bool = True,
+        use_flash_attn: bool = True,  # Enable memory-efficient attention
     ):
         super().__init__()
         self.d_model = d_model
@@ -60,11 +82,13 @@ class SpatialAttention(nn.Module):
         self.head_dim = d_model // num_heads
         self.scale = self.head_dim ** -0.5
         self.use_rope = use_rope
-        
+        self.use_flash_attn = use_flash_attn and (FLASH_ATTN_AVAILABLE or XFORMERS_AVAILABLE)
+
         self.qkv = nn.Linear(d_model, d_model * 3, bias=qkv_bias)
         self.proj = nn.Linear(d_model, d_model, bias=proj_bias)
         self.attn_drop = nn.Dropout(attn_drop)
-        
+        self.attn_drop_p = attn_drop
+
         # 2D RoPE for spatial positions
         if use_rope:
             self.rope_2d = RoPE2D(
@@ -72,77 +96,99 @@ class SpatialAttention(nn.Module):
                 max_h=spatial_size,
                 max_w=spatial_size,
             )
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply spatial attention with 2D RoPE.
-        
+
         Args:
             x: Input tensor (B, T, H, W, d_model)
-            
+
         Returns:
             Output tensor (B, T, H, W, d_model)
         """
         B, T, H, W, C = x.shape
-        
+
         # Reshape for per-frame attention: (B*T, H*W, C)
         x_flat = rearrange(x, 'b t h w c -> (b t) (h w) c')
-        
+
         # Compute QKV
         qkv = self.qkv(x_flat)  # (B*T, H*W, 3*C)
         q, k, v = qkv.chunk(3, dim=-1)
-        
-        # Reshape for multi-head attention: (B*T, num_heads, H*W, head_dim)
-        q = q.view(-1, H * W, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(-1, H * W, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(-1, H * W, self.num_heads, self.head_dim).transpose(1, 2)
-        
+
+        # Reshape for multi-head attention: (B*T, H*W, num_heads, head_dim) for flash attn
+        # or (B*T, num_heads, H*W, head_dim) for standard attn
+        BT = B * T
+        seq_len = H * W
+
+        q = q.view(BT, seq_len, self.num_heads, self.head_dim)
+        k = k.view(BT, seq_len, self.num_heads, self.head_dim)
+        v = v.view(BT, seq_len, self.num_heads, self.head_dim)
+
         # Apply 2D RoPE to queries and keys
         if self.use_rope:
             # Reshape to (B*T, H, W, num_heads, head_dim) for 2D RoPE
-            q_spatial = q.transpose(1, 2).view(-1, H, W, self.num_heads, self.head_dim)
-            k_spatial = k.transpose(1, 2).view(-1, H, W, self.num_heads, self.head_dim)
-            
+            q_spatial = q.view(BT, H, W, self.num_heads, self.head_dim)
+            k_spatial = k.view(BT, H, W, self.num_heads, self.head_dim)
+
             q_spatial = self.rope_2d(q_spatial)
             k_spatial = self.rope_2d(k_spatial)
-            
-            # Reshape back to (B*T, num_heads, H*W, head_dim)
-            q = q_spatial.view(-1, H * W, self.num_heads, self.head_dim).transpose(1, 2)
-            k = k_spatial.view(-1, H * W, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        # Compute attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B*T, num_heads, H*W, H*W)
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        
-        # Apply attention to values
-        out = attn @ v  # (B*T, num_heads, H*W, head_dim)
-        out = out.transpose(1, 2).reshape(-1, H * W, C)  # (B*T, H*W, C)
-        
+
+            # Reshape back
+            q = q_spatial.view(BT, seq_len, self.num_heads, self.head_dim)
+            k = k_spatial.view(BT, seq_len, self.num_heads, self.head_dim)
+
+        # Compute attention using memory-efficient implementation if available
+        if self.use_flash_attn and FLASH_ATTN_AVAILABLE:
+            # Flash Attention expects (B, seq_len, num_heads, head_dim)
+            out = flash_attn_func(
+                q, k, v,
+                dropout_p=self.attn_drop_p if self.training else 0.0,
+                softmax_scale=self.scale,
+            )  # (B*T, H*W, num_heads, head_dim)
+            out = out.reshape(BT, seq_len, C)
+        elif self.use_flash_attn and XFORMERS_AVAILABLE:
+            # xformers expects (B, seq_len, num_heads, head_dim)
+            out = memory_efficient_attention(
+                q, k, v,
+                scale=self.scale,
+            )  # (B*T, H*W, num_heads, head_dim)
+            out = out.reshape(BT, seq_len, C)
+        else:
+            # Standard attention fallback
+            q = q.transpose(1, 2)  # (B*T, num_heads, H*W, head_dim)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+
+            attn = (q @ k.transpose(-2, -1)) * self.scale  # (B*T, num_heads, H*W, H*W)
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+
+            out = attn @ v  # (B*T, num_heads, H*W, head_dim)
+            out = out.transpose(1, 2).reshape(BT, seq_len, C)  # (B*T, H*W, C)
+
         # Project output
         out = self.proj(out)
-        
+
         # Reshape back
         out = rearrange(out, '(b t) (h w) c -> b t h w c', b=B, t=T, h=H, w=W)
-        
+
         return out
 
 
 class TemporalAttention(nn.Module):
     """Temporal attention across all streams (joint attention) with 1D RoPE.
-    
+
     CORRECTED IMPLEMENTATION:
     - NO causal masking (bidirectional non-autoregressive attention for MaskGIT-style generation)
     - NO spatial pooling (each spatial patch treated independently)
     - Actions repeated for each spatial patch to enable spatial-specific conditioning
-    
+
     Concatenates all streams and applies attention across temporal dimension.
     Uses 1D Rotary Position Embeddings as described in the paper.
-    
-    Design note: Uses a single shared QKV projection for all streams. Stream identity
-    is implicit via position in the concatenated sequence [v_p, v_f, a_p, a_f].
-    Optionally, stream-type embeddings can be added to make stream identity explicit.
+
+    Memory optimization: Uses Flash Attention or xformers when available.
     """
-    
+
     def __init__(
         self,
         d_model: int,
@@ -153,6 +199,7 @@ class TemporalAttention(nn.Module):
         attn_drop: float = 0.0,
         use_rope: bool = True,
         use_stream_type_emb: bool = False,
+        use_flash_attn: bool = True,  # Enable memory-efficient attention
     ):
         super().__init__()
         self.d_model = d_model
@@ -161,121 +208,134 @@ class TemporalAttention(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.use_rope = use_rope
         self.use_stream_type_emb = use_stream_type_emb
-        
+        self.use_flash_attn = use_flash_attn and (FLASH_ATTN_AVAILABLE or XFORMERS_AVAILABLE)
+
         # Single shared QKV projection for all streams
-        # Alternative: separate QKV per stream (not implemented here)
         self.qkv = nn.Linear(d_model, d_model * 3, bias=qkv_bias)
         self.proj = nn.Linear(d_model, d_model, bias=proj_bias)
         self.attn_drop = nn.Dropout(attn_drop)
-        
+        self.attn_drop_p = attn_drop
+
         # Optional stream-type embeddings to make stream identity explicit
-        # 4 stream types: v_p (past video), v_f (future video), a_p (past action), a_f (future action)
         if use_stream_type_emb:
             self.stream_type_emb = nn.Parameter(torch.zeros(4, d_model))
             nn.init.normal_(self.stream_type_emb, std=0.02)
-        
+
         # 1D RoPE for temporal positions
         if use_rope:
             self.rope_1d = RoPE1D(
                 head_dim=self.head_dim,
                 max_seq_len=max_seq_len,
             )
-    
+
     def forward(
         self,
         v_p: torch.Tensor,
         v_f: torch.Tensor,
         a_p: torch.Tensor,
         a_f: torch.Tensor,
-        causal: bool = False,  # CORRECTED: Default to False for bidirectional attention
+        causal: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply joint temporal attention across all streams with 1D RoPE.
-        
-        CORRECTED: No causal masking (bidirectional), no spatial pooling.
-        
+
         Args:
             v_p: Past video tokens (B, T_p, S, d_model) where S = H*W
             v_f: Future video tokens (B, T_f, S, d_model)
             a_p: Past action tokens (B, T_p, d_model)
             a_f: Future action tokens (B, T_f, d_model)
             causal: Whether to apply causal masking (default False for MaskGIT-style)
-            
+
         Returns:
             Updated tokens for each stream
         """
         B = v_p.shape[0]
         T_p, T_f = v_p.shape[1], v_f.shape[1]
         S = v_p.shape[2]  # Spatial dimension (H*W)
-        
-        # CORRECTED: NO spatial pooling - treat each spatial patch independently
+
         # Reshape video tokens: (B, T, S, d) -> (B*S, T, d)
-        # This allows each spatial patch to attend independently
-        v_p_reshaped = rearrange(v_p, 'b t s d -> (b s) t d')  # (B*S, T_p, d)
-        v_f_reshaped = rearrange(v_f, 'b t s d -> (b s) t d')  # (B*S, T_f, d)
-        
-        # CORRECTED: Repeat actions for each spatial patch
-        # This enables spatial-specific action conditioning
-        # Use einops repeat for cleaner code: (B, T, d) -> (B*S, T, d)
-        a_p_reshaped = repeat(a_p, 'b t d -> (b s) t d', s=S)  # (B*S, T_p, d)
-        a_f_reshaped = repeat(a_f, 'b t d -> (b s) t d', s=S)  # (B*S, T_f, d)
-        
+        v_p_reshaped = rearrange(v_p, 'b t s d -> (b s) t d')
+        v_f_reshaped = rearrange(v_f, 'b t s d -> (b s) t d')
+
+        # Repeat actions for each spatial patch: (B, T, d) -> (B*S, T, d)
+        a_p_reshaped = repeat(a_p, 'b t d -> (b s) t d', s=S)
+        a_f_reshaped = repeat(a_f, 'b t d -> (b s) t d', s=S)
+
         # Concatenate all streams: [v_p, v_f, a_p, a_f]
-        # Total sequence length: T_p + T_f + T_p + T_f = 2*(T_p + T_f)
-        # Stream identity is implicit via position in this concatenation
-        all_tokens = torch.cat([v_p_reshaped, v_f_reshaped, a_p_reshaped, a_f_reshaped], dim=1)  # (B*S, total_T, d)
+        all_tokens = torch.cat([v_p_reshaped, v_f_reshaped, a_p_reshaped, a_f_reshaped], dim=1)
+        BS = B * S
         total_T = all_tokens.shape[1]
-        
-        # Optionally add stream-type embeddings to make stream identity explicit
+
+        # Optionally add stream-type embeddings
         if self.use_stream_type_emb:
-            # Create stream type indices: [0,0,...,0, 1,1,...,1, 2,2,...,2, 3,3,...,3]
-            # for [v_p, v_f, a_p, a_f] respectively
             stream_indices = torch.cat([
-                torch.zeros(T_p, dtype=torch.long, device=all_tokens.device),  # v_p
-                torch.ones(T_f, dtype=torch.long, device=all_tokens.device),  # v_f
-                torch.full((T_p,), 2, dtype=torch.long, device=all_tokens.device),  # a_p
-                torch.full((T_f,), 3, dtype=torch.long, device=all_tokens.device),  # a_f
-            ])  # (total_T,)
-            stream_emb = self.stream_type_emb[stream_indices]  # (total_T, d_model)
-            all_tokens = all_tokens + stream_emb.unsqueeze(0)  # (B*S, total_T, d_model)
-        
+                torch.zeros(T_p, dtype=torch.long, device=all_tokens.device),
+                torch.ones(T_f, dtype=torch.long, device=all_tokens.device),
+                torch.full((T_p,), 2, dtype=torch.long, device=all_tokens.device),
+                torch.full((T_f,), 3, dtype=torch.long, device=all_tokens.device),
+            ])
+            stream_emb = self.stream_type_emb[stream_indices]
+            all_tokens = all_tokens + stream_emb.unsqueeze(0)
+
         # Compute QKV
         qkv = self.qkv(all_tokens)  # (B*S, total_T, 3*d)
         q, k, v = qkv.chunk(3, dim=-1)
-        
-        # Reshape for multi-head attention: (B*S, num_heads, total_T, head_dim)
-        q = q.view(-1, total_T, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(-1, total_T, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(-1, total_T, self.num_heads, self.head_dim).transpose(1, 2)
-        
+
+        # Reshape: (B*S, total_T, num_heads, head_dim)
+        q = q.view(BS, total_T, self.num_heads, self.head_dim)
+        k = k.view(BS, total_T, self.num_heads, self.head_dim)
+        v = v.view(BS, total_T, self.num_heads, self.head_dim)
+
         # Apply 1D RoPE to queries and keys
         if self.use_rope:
-            # Transpose for RoPE: (B*S, total_T, num_heads, head_dim)
-            q_temp = q.transpose(1, 2)
-            k_temp = k.transpose(1, 2)
-            
-            q_temp = self.rope_1d(q_temp)
-            k_temp = self.rope_1d(k_temp)
-            
-            # Transpose back: (B*S, num_heads, total_T, head_dim)
-            q = q_temp.transpose(1, 2)
-            k = k_temp.transpose(1, 2)
-        
-        # Compute attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B*S, num_heads, total_T, total_T)
-        
-        # CORRECTED: NO causal masking by default (bidirectional for MaskGIT-style)
-        # Only apply if explicitly requested (for compatibility)
-        if causal:
-            # Apply causal mask
-            causal_mask = torch.triu(torch.ones(total_T, total_T, device=attn.device, dtype=torch.bool), diagonal=1)
-            attn = attn.masked_fill(causal_mask, float('-inf'))
-        
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        
-        # Apply attention to values
-        out = attn @ v  # (B*S, num_heads, total_T, head_dim)
-        out = out.transpose(1, 2).reshape(-1, total_T, self.d_model)  # (B*S, total_T, d)
+            q = self.rope_1d(q)
+            k = self.rope_1d(k)
+
+        # Compute attention using memory-efficient implementation if available
+        if self.use_flash_attn and FLASH_ATTN_AVAILABLE and not causal:
+            # Flash Attention (bidirectional)
+            out = flash_attn_func(
+                q, k, v,
+                dropout_p=self.attn_drop_p if self.training else 0.0,
+                softmax_scale=self.scale,
+                causal=False,
+            )
+            out = out.reshape(BS, total_T, self.d_model)
+        elif self.use_flash_attn and FLASH_ATTN_AVAILABLE and causal:
+            # Flash Attention (causal)
+            out = flash_attn_func(
+                q, k, v,
+                dropout_p=self.attn_drop_p if self.training else 0.0,
+                softmax_scale=self.scale,
+                causal=True,
+            )
+            out = out.reshape(BS, total_T, self.d_model)
+        elif self.use_flash_attn and XFORMERS_AVAILABLE:
+            # xformers memory-efficient attention
+            out = memory_efficient_attention(
+                q, k, v,
+                scale=self.scale,
+            )
+            out = out.reshape(BS, total_T, self.d_model)
+        else:
+            # Standard attention fallback
+            q = q.transpose(1, 2)  # (B*S, num_heads, total_T, head_dim)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+
+            if causal:
+                causal_mask = torch.triu(
+                    torch.ones(total_T, total_T, device=attn.device, dtype=torch.bool),
+                    diagonal=1
+                )
+                attn = attn.masked_fill(causal_mask, float('-inf'))
+
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+
+            out = attn @ v
+            out = out.transpose(1, 2).reshape(BS, total_T, self.d_model)
         
         # Project output
         out = self.proj(out)
@@ -312,6 +372,8 @@ class SharedTransformerBlock(nn.Module):
     - layers >= shared_layers_start: Modality sharing for spatial attention
         - Video streams (v_p, v_f) share spatial attention
     - Final MLPs always use distinct weights per stream (as per diagram)
+
+    Memory optimization: Supports Flash Attention / xformers when available.
     """
 
     def __init__(
@@ -324,15 +386,17 @@ class SharedTransformerBlock(nn.Module):
         self.config = config
         self.use_sharing = layer_idx >= config.shared_layers_start
 
+        # Get flash attention setting from config (default True for auto-detection)
+        use_flash_attn = getattr(config, 'use_flash_attn', True)
+
         # Layer norms
         self.spatial_norm = nn.LayerNorm(config.d_model)
-        self.spatial_mlp_norm = nn.LayerNorm(config.d_model)  # For intermediate MLP after spatial attn
+        self.spatial_mlp_norm = nn.LayerNorm(config.d_model)
         self.temporal_norm = nn.LayerNorm(config.d_model)
         self.mlp_norm = nn.LayerNorm(config.d_model)
 
         # Spatial attention (video only) with 2D RoPE
         if self.use_sharing:
-            # Shared spatial attention for both video streams
             self.spatial_attn = SpatialAttention(
                 d_model=config.d_model,
                 num_heads=config.num_heads,
@@ -341,9 +405,9 @@ class SharedTransformerBlock(nn.Module):
                 proj_bias=config.proj_bias,
                 attn_drop=config.attn_drop,
                 use_rope=config.use_rope,
+                use_flash_attn=use_flash_attn,
             )
         else:
-            # Separate spatial attention for each video stream
             self.spatial_attn_vp = SpatialAttention(
                 d_model=config.d_model,
                 num_heads=config.num_heads,
@@ -352,6 +416,7 @@ class SharedTransformerBlock(nn.Module):
                 proj_bias=config.proj_bias,
                 attn_drop=config.attn_drop,
                 use_rope=config.use_rope,
+                use_flash_attn=use_flash_attn,
             )
             self.spatial_attn_vf = SpatialAttention(
                 d_model=config.d_model,
@@ -361,10 +426,10 @@ class SharedTransformerBlock(nn.Module):
                 proj_bias=config.proj_bias,
                 attn_drop=config.attn_drop,
                 use_rope=config.use_rope,
+                use_flash_attn=use_flash_attn,
             )
 
-        # Intermediate MLP for video streams (after spatial attention, before temporal)
-        # This matches the diagram which shows MLP between spatial and temporal for video
+        # Intermediate MLP for video streams
         if self.use_sharing:
             self.spatial_mlp = MLP(
                 d_model=config.d_model,
@@ -384,7 +449,6 @@ class SharedTransformerBlock(nn.Module):
             )
 
         # Temporal attention (joint across all streams) with 1D RoPE
-        # max_seq_len = 2 * (T_p + T_f) for concatenated streams
         max_temporal_len = 2 * (config.num_past_frames + config.num_future_frames)
         self.temporal_attn = TemporalAttention(
             d_model=config.d_model,
@@ -395,6 +459,7 @@ class SharedTransformerBlock(nn.Module):
             attn_drop=config.attn_drop,
             use_rope=config.use_rope,
             use_stream_type_emb=config.use_stream_type_emb,
+            use_flash_attn=use_flash_attn,
         )
 
         # Final MLP - distinct weights per stream (as per diagram caption:
@@ -494,24 +559,50 @@ class SharedTransformerBlock(nn.Module):
 
 class SharedTransformer(nn.Module):
     """Transformer with parameter sharing for 4-stream inputs.
-    
+
     Implements the Masked-HWM architecture with:
     - Factorized attention: Spatial (video only) + Temporal (joint)
     - Parameter sharing: First 4 layers unshared, remaining layers shared
+
+    Memory optimization:
+    - Gradient checkpointing: Recomputes activations during backward pass
+      to reduce memory usage by ~50% at the cost of ~20% extra compute.
     """
-    
+
     def __init__(self, config: MaskedHWMConfig):
         super().__init__()
         self.config = config
-        
+        self.use_gradient_checkpointing = getattr(config, 'use_gradient_checkpointing', False)
+
         self.layers = nn.ModuleList([
             SharedTransformerBlock(i, config)
             for i in range(config.num_layers)
         ])
-        
+
         # Final layer norm
         self.final_norm = nn.LayerNorm(config.d_model)
-    
+
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for memory efficiency."""
+        self.use_gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        """Disable gradient checkpointing."""
+        self.use_gradient_checkpointing = False
+
+    def _checkpoint_forward(self, layer, v_p, v_f, a_p, a_f):
+        """Wrapper for checkpointing that handles multiple outputs."""
+        def create_custom_forward(module):
+            def custom_forward(*inputs):
+                return module(*inputs)
+            return custom_forward
+
+        return checkpoint(
+            create_custom_forward(layer),
+            v_p, v_f, a_p, a_f,
+            use_reentrant=False,  # Recommended for PyTorch 2.0+
+        )
+
     def forward(
         self,
         v_p: torch.Tensor,
@@ -520,23 +611,39 @@ class SharedTransformer(nn.Module):
         a_f: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass through transformer.
-        
+
         Args:
             v_p: Past video tokens (B, T_p, H, W, d_model)
             v_f: Future video tokens (B, T_f, H, W, d_model)
             a_p: Past action tokens (B, T_p, d_model)
             a_f: Future action tokens (B, T_f, d_model)
-            
+
         Returns:
             Updated tokens for each stream
         """
         for layer in self.layers:
-            v_p, v_f, a_p, a_f = layer(v_p, v_f, a_p, a_f)
-        
+            if self.use_gradient_checkpointing and self.training:
+                # Use gradient checkpointing to save memory during training
+                v_p, v_f, a_p, a_f = self._checkpoint_forward(layer, v_p, v_f, a_p, a_f)
+            else:
+                v_p, v_f, a_p, a_f = layer(v_p, v_f, a_p, a_f)
+
         # Final layer norm
         v_p = self.final_norm(v_p)
         v_f = self.final_norm(v_f)
         a_p = self.final_norm(a_p)
         a_f = self.final_norm(a_f)
-        
+
         return v_p, v_f, a_p, a_f
+
+
+# Utility function to print memory optimization status
+def print_memory_optimization_status():
+    """Print the status of available memory optimizations."""
+    print("=" * 50)
+    print("Memory Optimization Status:")
+    print("=" * 50)
+    print(f"  Flash Attention:  {'Available' if FLASH_ATTN_AVAILABLE else 'Not installed (pip install flash-attn)'}")
+    print(f"  xformers:         {'Available' if XFORMERS_AVAILABLE else 'Not installed (pip install xformers)'}")
+    print(f"  Gradient Ckpt:    Always available (PyTorch built-in)")
+    print("=" * 50)

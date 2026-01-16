@@ -60,6 +60,9 @@ Cosmos-Tokenizer/
 /*.tiff
 /*.tif
 
+# Videos (large files)
+videos/
+
 # Temporary files
 *.tmp
 *.temp
