@@ -21,7 +21,7 @@ __pycache__/
 # Distribution / packaging
 *.egg-info/
 dist/
-build/
+#build/
 *.egg
 
 # Virtual environments
@@ -32,6 +32,7 @@ ENV/
 # IDE
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 *~
@@ -44,7 +45,26 @@ Thumbs.db
 *.log
 logs/
 
+# Local model assets
+cosmos_tokenizer/
+Cosmos-Tokenizer/
+1xgpt/
+
+# Images (root only)
+/*.png
+/*.jpg
+/*.jpeg
+/*.gif
+/*.webp
+/*.bmp
+/*.tiff
+/*.tif
+
 # Temporary files
 *.tmp
 *.temp
 *.bak
+
+# Local notes (do not add)
+DEBUG_FLOW_HWM_DECODING.md
+build/masked_hwm/readme.md

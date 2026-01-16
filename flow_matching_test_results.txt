@@ -1,0 +1,12 @@
+=== Dataset sanity ===
+latent_past: (1, 16, 3, 16, 16)
+latent_future: (1, 16, 3, 16, 16)
+actions_past: (1, 17, 25)
+actions_future: (1, 17, 25)
+
+=== Single forward pass ===
+loss: 0.830714
+
+=== Short overfit (30 steps) ===
+start loss: 0.833593
+end loss:   0.451531

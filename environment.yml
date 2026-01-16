@@ -1,0 +1,76 @@
+# Conda environment for Humanoid World Model
+# This environment includes all dependencies for training and inference
+# Target GPU: RTX 4090 (24GB) or similar with CUDA 12.1+
+
+name: cosmos-tokenizer
+
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      # ========================================
+      # Core ML Frameworks
+      # ========================================
+      # PyTorch with CUDA 12.1 support
+      - torch==2.3.0
+      - torchvision==0.18.0
+      # Memory-efficient attention
+      - xformers==0.0.26.post1
+      # Flash attention for faster training
+      # Note: Installed separately with FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE
+
+      # ========================================
+      # Cosmos Tokenizer Dependencies
+      # ========================================
+      - loguru>=0.7.0           # Logging
+      - mediapy==1.1.6          # Media I/O
+      - einops==0.7.0           # Tensor operations
+      - einx==0.1.3             # Extended einops
+      - huggingface-hub>=0.26.2 # HuggingFace model hub
+      - ipdb>=0.13.13           # Debugging
+
+      # ========================================
+      # Training Framework Dependencies
+      # ========================================
+      - accelerate==0.30.1      # Distributed training
+      - transformers==4.41.0    # Transformer models
+      - lightning>=2.3.1        # PyTorch Lightning
+      - wandb                   # Experiment tracking
+      - tqdm==4.66.4           # Progress bars
+
+      # ========================================
+      # Numerical and Scientific Computing
+      # ========================================
+      - numpy>=1.24.0           # Numerical arrays
+      - scipy>=1.9.0            # Scientific computing
+      - matplotlib              # Plotting
+
+      # ========================================
+      # Image and Video Processing
+      # ========================================
+      - Pillow>=10.0.0          # Image processing
+      - lpips>=0.1.4            # Perceptual similarity
+
+      # ========================================
+      # Monitoring and Logging
+      # ========================================
+      - tensorboard>=2.14.0     # TensorBoard logging
+
+      # ========================================
+      # Build and Packaging Tools
+      # ========================================
+      - wheel                   # Wheel support
+      - packaging               # Packaging utilities
+      - ninja                   # Build system
+
+      # ========================================
+      # Additional Utilities
+      # ========================================
+      # Note: flash-attn==2.5.8 should be installed separately:
+      #   FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE pip install flash-attn==2.5.8 --no-build-isolation
