@@ -58,6 +58,11 @@ logs/
 *.bmp
 *.tiff
 *.svg
+# Exception: README referenced loss curve images
+!Loss_curves_author/Author/Loss_Flow_HWM.png
+!Loss_curves_author/Author/Masked_HWM_Loss1.png
+!Loss_curves_author/run/loss_curves_Flow_HWM.png
+!Loss_curves_author/run/Masked_HWM_loss.png
 
 # Output directories with generated content
 test_output/

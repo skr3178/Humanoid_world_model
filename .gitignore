@@ -59,9 +59,15 @@ Cosmos-Tokenizer/
 /*.bmp
 /*.tiff
 /*.tif
+# Exception: README referenced GIF
+!ScreenRecording2026-01-17at10.43.53AM-ezgif.com-video-to-gif-converter.gif
 
 # Videos (large files)
 videos/
+# Exception: README referenced GIFs in videos directory
+!videos/debug_flowhwm_ckpt24000/sample_0/prediction.gif
+!videos/debug_flowhwm_ckpt24000/sample_0/noise_schedule.gif
+!videos/debug_flowhwm_ckpt24000/sample_0/comparison.gif
 
 # Temporary files
 *.tmp
